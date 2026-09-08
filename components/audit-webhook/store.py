@@ -59,7 +59,8 @@ CREATE INDEX IF NOT EXISTS idx_sandbox_access_log_sandbox_time
 # NULL until the first audit event arrives.
 # ``created_at`` holds the sandbox's BatchSandbox creationTimestamp on
 # discovery-inserted rows; ``node_ip`` is the IP of the node the sandbox
-# pod runs on (synced from the cluster).
+# pod runs on (synced from the cluster); ``user_id`` is the user id from
+# the BatchSandbox's claw-data volumeMount subPath (synced likewise).
 _CREATE_SUMMARY_TABLE = """
 CREATE TABLE IF NOT EXISTS sandbox_access_latest (
     sandbox_id    TEXT        PRIMARY KEY,
@@ -72,19 +73,21 @@ CREATE TABLE IF NOT EXISTS sandbox_access_latest (
     accessed      BOOLEAN     NOT NULL DEFAULT TRUE,
     created_at    TIMESTAMPTZ,
     node_ip       TEXT,
+    user_id       TEXT,
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT date_trunc('second', now())
 );
 """
 
 # Migrations for tables created before the ``deleted``/``accessed``/
-# ``created_at``/``node_ip`` columns existed; the request columns must be
-# nullable to hold unaccessed rows.
+# ``created_at``/``node_ip``/``user_id`` columns existed; the request
+# columns must be nullable to hold unaccessed rows.
 _ALTER_SUMMARY_MIGRATIONS = """
 ALTER TABLE sandbox_access_latest
     ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT FALSE,
     ADD COLUMN IF NOT EXISTS accessed BOOLEAN NOT NULL DEFAULT TRUE,
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS node_ip TEXT;
+    ADD COLUMN IF NOT EXISTS node_ip TEXT,
+    ADD COLUMN IF NOT EXISTS user_id TEXT;
 ALTER TABLE sandbox_access_latest
     ALTER COLUMN uri DROP NOT NULL,
     ALTER COLUMN method DROP NOT NULL,
@@ -122,46 +125,77 @@ WHERE EXCLUDED.request_time >= sandbox_access_latest.request_time
 """.format(now=_TRUNCATED_NOW)
 
 # Placeholder rows for sandboxes discovered in the cluster before any
-# request arrived. Rows that already exist get their ``created_at``
-# backfilled when still NULL (e.g. the sandbox was accessed before the
-# first sync ran) - everything else is left untouched. One statement for
-# all ids (the DB may be a high-latency round trip away); RETURNING
-# splits inserted vs. backfilled rows (``xmax = 0`` marks fresh inserts).
+# request arrived. Rows that already exist get their ``created_at``/
+# ``user_id`` backfilled when still NULL (e.g. the sandbox was accessed
+# before the first sync ran) - everything else is left untouched. One
+# statement for all ids (the DB may be a high-latency round trip away);
+# RETURNING splits inserted vs. backfilled rows (``xmax = 0`` marks
+# fresh inserts).
 _INSERT_DISCOVERED = """
 INSERT INTO sandbox_access_latest
-    (sandbox_id, uri, method, target, request_time, request_count, accessed, created_at, updated_at)
-SELECT name, NULL, NULL, NULL, NULL, 0, FALSE, created_at, {now}
-FROM unnest(%(ids)s::text[], %(created)s::timestamptz[]) AS discovered(name, created_at)
+    (sandbox_id, uri, method, target, request_time, request_count, accessed, created_at, user_id, updated_at)
+SELECT name, NULL, NULL, NULL, NULL, 0, FALSE, created_at, user_id, {now}
+FROM unnest(%(ids)s::text[], %(created)s::timestamptz[], %(users)s::text[])
+    AS discovered(name, created_at, user_id)
 ON CONFLICT (sandbox_id) DO UPDATE SET
-    created_at = EXCLUDED.created_at
-WHERE sandbox_access_latest.created_at IS NULL
-  AND EXCLUDED.created_at IS NOT NULL
+    created_at = EXCLUDED.created_at,
+    user_id = COALESCE(
+        EXCLUDED.user_id, sandbox_access_latest.user_id
+    )
+WHERE (sandbox_access_latest.created_at IS NULL
+       AND EXCLUDED.created_at IS NOT NULL)
+   OR (sandbox_access_latest.user_id IS NULL
+       AND EXCLUDED.user_id IS NOT NULL)
 RETURNING (xmax = 0) AS inserted
 """.format(now=_TRUNCATED_NOW)
 
+# Summary listing grouped by user. A user runs at most one sandbox at a
+# time, so a non-deleted member set per user is normally exactly one
+# row: the listing reports that current sandbox (``sandbox_id``) next
+# to the user, with a ``sandbox_count`` fallback for the (unexpected)
+# multi-active case. Sandboxes without a user_id fall back to
+# per-sandbox stats (uid = sandbox id, user_id NULL). The member CTE
+# filters first, so a group is included when any member matches the
+# search/time filters. Deleted history is hidden here but stays
+# queryable through /api/requests (the user filter includes it).
 # The window count piggybacks the total on the listing query so a page
-# load costs one round trip instead of two; the plain COUNT remains as a
-# fallback for pages past the end (no rows returned -> no total known).
-# Deleted rows stay listed (flagged) - hiding them made date searches
-# empty out as soon as ephemeral sandboxes were removed from the cluster.
+# load costs one round trip instead of two; the plain COUNT remains as
+# a fallback for pages past the end (no rows returned -> no total known).
 _LIST_LATEST = """
-SELECT sandbox_id, uri, method, target, request_time, request_count, accessed, created_at, node_ip, deleted,
+WITH member AS (
+    SELECT sandbox_id, request_time, request_count, accessed, created_at,
+           COALESCE(user_id, sandbox_id) AS uid, user_id, node_ip
+    FROM sandbox_access_latest
+    WHERE NOT deleted {extra}
+)
+SELECT uid,
+       max(user_id) AS user_id,
+       max(sandbox_id) AS sandbox_id,
+       max(node_ip) AS node_ip,
+       count(*) AS sandbox_count,
+       bool_and(accessed) AS accessed,
+       min(created_at) AS created_at,
+       max(request_time) AS request_time,
+       sum(request_count) AS request_count,
        count(*) OVER () AS __total
-FROM sandbox_access_latest
-WHERE TRUE {extra}
+FROM member
+GROUP BY uid
 ORDER BY {order}
 LIMIT %(limit)s OFFSET %(offset)s
 """
 
 _COUNT_LATEST = """
-SELECT count(*) AS total
-FROM sandbox_access_latest
-WHERE TRUE {extra}
+WITH member AS (
+    SELECT COALESCE(user_id, sandbox_id) AS uid
+    FROM sandbox_access_latest
+    WHERE NOT deleted {extra}
+)
+SELECT count(*) AS total FROM (SELECT uid FROM member GROUP BY uid) AS groups
 """
 
-# Whitelisted sort orders for the summary table. Never-accessed rows have
-# a NULL request_time and always sort last within an accessed group;
-# discovered rows without a creation timestamp always sort last.
+# Whitelisted sort orders for the grouped summary listing. Never-accessed
+# rows have a NULL request_time and always sort last within an accessed
+# group; groups without a creation timestamp always sort last.
 _LATEST_ORDERS = {
     "request_time": "request_time ASC",
     "-request_time": "request_time DESC NULLS LAST",
@@ -174,17 +208,19 @@ _LATEST_ORDERS = {
 }
 
 _LIST_DETAILS = """
-SELECT id, sandbox_id, uri, method, target, request_time, received_at,
+SELECT log.id, log.sandbox_id, log.uri, log.method, log.target, log.request_time, log.received_at,
+       latest.user_id, latest.deleted AS sandbox_deleted,
        count(*) OVER () AS __total
-FROM sandbox_access_log
+FROM sandbox_access_log AS log
+LEFT JOIN sandbox_access_latest AS latest ON latest.sandbox_id = log.sandbox_id
 WHERE {where}
-ORDER BY id DESC
+ORDER BY log.id DESC
 LIMIT %(limit)s OFFSET %(offset)s
 """
 
 _COUNT_DETAILS = """
 SELECT count(*) AS total
-FROM sandbox_access_log
+FROM sandbox_access_log AS log
 WHERE {where}
 """
 
@@ -230,17 +266,25 @@ class AuditStore:
         time_from: datetime | None = None,
         time_to: datetime | None = None,
     ) -> dict:
-        """List per-sandbox latest requests, sorted by ``sort``.
+        """List per-user summary groups, sorted by ``sort``.
 
-        Rows whose sandbox resource is gone are included with
-        ``deleted = TRUE`` (shown as ``已删除`` in the UI) - the audit
-        history of removed ephemeral sandboxes stays searchable.
-        ``search`` matches sandbox ids by substring (case-insensitive,
-        fuzzy) OR node IPs exactly - typing an IP returns every sandbox
-        on that node. ``time_from``/``time_to`` bound the latest request
-        time (inclusive; naive timestamps are assumed to be UTC). ``sort``
-        is a whitelisted key from ``_LATEST_ORDERS`` (``-`` prefix means
-        descending); default is newest first.
+        A user runs at most one sandbox at a time, so each group
+        normally holds one non-deleted sandbox: the row shows the user
+        (``user_id``) next to their current sandbox (``sandbox_id``),
+        with ``sandbox_count`` > 1 flagging the unexpected multi-active
+        case. Sandboxes without a user id report per-sandbox stats with
+        ``user_id = NULL``. Rows whose sandbox resource is gone
+        (``deleted = TRUE``) are hidden from the listing - the audit
+        history of removed ephemeral sandboxes stays queryable through
+        ``list_details``. ``search`` matches user ids / sandbox ids by
+        substring (case-insensitive, fuzzy) OR node IPs exactly - typing
+        an IP returns every sandbox on that node (a group is included
+        when any member matches). ``time_from``/``time_to`` bind the
+        latest request time (inclusive; naive timestamps are assumed to
+        be UTC). ``sort`` is a whitelisted key from ``_LATEST_ORDERS``
+        (``-`` prefix means descending); default is newest first. The
+        group's ``node_ip`` is its current sandbox's node (a NULL when
+        the pod is not scheduled yet).
         """
         try:
             order = _LATEST_ORDERS[sort]
@@ -250,13 +294,14 @@ class AuditStore:
         params: dict = {"limit": limit, "offset": offset}
         conditions = []
         if search:
-            # Fuzzy match on sandbox_id OR exact match on node_ip; escape
-            # LIKE wildcards in the input so user input is matched
-            # literally. node_ip is a plain equality (IPs are not fuzzy).
+            # Fuzzy match on the group key (user id or bare sandbox id) OR
+            # member sandbox ids OR exact member node_ip; escape LIKE
+            # wildcards so user input is matched literally.
             params["pattern"] = f"%{_like_escape(search)}%"
             params["node_ip"] = search
             conditions.append(
-                "(sandbox_id ILIKE %(pattern)s ESCAPE '\\'"
+                "(COALESCE(user_id, sandbox_id) ILIKE %(pattern)s ESCAPE '\\'"
+                " OR sandbox_id ILIKE %(pattern)s ESCAPE '\\'"
                 " OR node_ip = %(node_ip)s)"
             )
         if time_from is not None:
@@ -283,22 +328,44 @@ class AuditStore:
         return {"total": total, "items": [_jsonify(row) for row in rows]}
 
     def list_details(
-        self, sandbox_id: str | None = None, limit: int = 50, offset: int = 0
+        self,
+        sandbox_id: str | None = None,
+        user_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
     ) -> dict:
-        """List access request details, newest first, optionally filtered by sandbox."""
+        """List access request details, newest first, filterable by sandbox
+        or by user id.
+
+        The user filter covers the user's *whole history* - current and
+        already-removed (deleted) sandboxes alike - and each row carries
+        ``sandbox_deleted`` so the UI can tell them apart.
+        """
         # Build the WHERE clause dynamically: psycopg cannot infer the type
         # of a NULL-bound parameter, and skipping the filter entirely lets
         # the query planner use the (sandbox_id, request_time) index.
+        # The user filter resolves to all of the user's sandbox ids via
+        # the summary table (deleted ones included - history).
+        conditions, params = [], {}
         if sandbox_id:
-            where, params = "sandbox_id = %(sandbox_id)s", {"sandbox_id": sandbox_id}
-        else:
-            where, params = "TRUE", {}
+            conditions.append("log.sandbox_id = %(sandbox_id)s")
+            params["sandbox_id"] = sandbox_id
+        if user_id:
+            conditions.append(
+                "log.sandbox_id IN (SELECT sandbox_id FROM sandbox_access_latest"
+                " WHERE user_id = %(user_id)s)"
+            )
+            params["user_id"] = user_id
+        where = " AND ".join(conditions) if conditions else "TRUE"
         params.update({"limit": limit, "offset": offset})
 
         with self.pool.connection() as conn:
             conn.row_factory = dict_row
             with conn.cursor() as cur:
-                cur.execute(_LIST_DETAILS.format(where=where), params)
+                cur.execute(
+                    _LIST_DETAILS.format(where=where),
+                    params,
+                )
                 rows = cur.fetchall()
                 if rows:
                     total = rows[0]["__total"]
@@ -312,24 +379,31 @@ class AuditStore:
 
     def upsert_discovered_sandboxes(self, sandboxes: list[dict]) -> dict:
         """Insert placeholder rows for unaccessed sandboxes and backfill
-        creation timestamps.
+        creation timestamps / user ids.
 
         ``sandboxes`` are the live BatchSandbox resources, each a dict
-        with ``name`` (the sandbox id) and ``created_at`` (the resource's
-        creationTimestamp, or None).
+        with ``name`` (the sandbox id), ``created_at`` (the resource's
+        creationTimestamp, or None) and ``user_id`` (from the claw-data
+        volumeMount subPath, or None).
 
         - Ids with no summary row get one marked ``accessed = FALSE``
           with NULL request fields, a zero request count and
-          ``created_at`` set (existing rows are otherwise untouched).
-        - Existing rows whose ``created_at`` is still NULL (e.g. the
-          sandbox was accessed before the first sync ran) get it
-          backfilled from the resource's creationTimestamp.
+          ``created_at``/``user_id`` set (existing rows are otherwise
+          untouched).
+        - Existing rows whose ``created_at``/``user_id`` is still NULL
+          get it backfilled from the resource.
 
         Returns ``{"discovered": <n>, "backfilled": <n>}``.
         """
         # One statement for all ids - each round trip to a remote
         # database can be slow.
-        deduped = {sandbox["name"]: sandbox.get("created_at") for sandbox in sandboxes}
+        deduped = {
+            sandbox["name"]: (
+                sandbox.get("created_at"),
+                sandbox.get("user_id"),
+            )
+            for sandbox in sandboxes
+        }
         if not deduped:
             return {"discovered": 0, "backfilled": 0}
         with self.pool.connection() as conn:
@@ -341,8 +415,9 @@ class AuditStore:
                         "ids": list(deduped),
                         "created": [
                             _ensure_utc(created) if created is not None else None
-                            for created in deduped.values()
+                            for created, _ in deduped.values()
                         ],
+                        "users": [user_id for _, user_id in deduped.values()],
                     },
                 )
                 flags = [row["inserted"] for row in cur.fetchall()]

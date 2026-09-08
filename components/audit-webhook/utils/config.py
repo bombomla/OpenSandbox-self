@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 # Points at the config file; the only setting that stays an env var.
 CONFIG_PATH_ENV = "AUDIT_CONFIG_PATH"
 
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "audit.toml"
+# audit.toml lives in the project root (one level above utils/).
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "audit.toml"
 
 _DEFAULTS = {
     "host": "0.0.0.0",
@@ -43,6 +44,7 @@ _DEFAULTS = {
     "k8s_namespace": "",
     "k8s_sync_interval": 0,
     "log_level": "INFO",
+    "excluded_uri_suffixes": ["ping"],
 }
 
 _INT_KEYS = ("port", "db_pool_min", "db_pool_max", "k8s_sync_interval")
@@ -60,6 +62,7 @@ _SECTION_KEYS = {
         "namespace": "k8s_namespace",
         "sync_interval": "k8s_sync_interval",
     },
+    "events": {"excluded_uri_suffixes": "excluded_uri_suffixes"},
     "log": {"level": "log_level"},
 }
 
@@ -112,5 +115,20 @@ def load_config(path: str | Path | None = None) -> dict:
             config[key] = int(config[key])
         except (TypeError, ValueError):
             raise ValueError(f"config key {key!r} must be an integer") from None
+
+    suffixes = config["excluded_uri_suffixes"]
+    if isinstance(suffixes, str):
+        # Accept a single string or an array of strings (case-insensitive
+        # suffix match against the event URI).
+        suffixes = [suffixes]
+    if (
+        not isinstance(suffixes, list)
+        or not all(isinstance(suffix, str) for suffix in suffixes)
+    ):
+        raise ValueError(
+            "config key 'excluded_uri_suffixes' must be a string or an array "
+            "of strings"
+        )
+    config["excluded_uri_suffixes"] = [suffix for suffix in suffixes if suffix]
 
     return config

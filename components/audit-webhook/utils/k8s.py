@@ -40,6 +40,11 @@ _BATCH_SANDBOX_PLURAL = "batchsandboxes"
 # reference's name is the sandbox id); see list_sandbox_pod_nodes.
 _BATCH_SANDBOX_KIND = "BatchSandbox"
 
+# The volumeMount carrying the avatar/user data in every sandbox pod; the
+# second path segment of its subPath is the user id
+# (e.g. subPath ``claw/7680071018521559040/v20260729/...`` -> ``7680071018521559040``).
+_USER_VOLUME_NAME = "claw-data"
+
 
 class K8sError(Exception):
     """Raised when the Kubernetes API cannot be reached or queried."""
@@ -89,7 +94,8 @@ class K8sClient:
         """Return the BatchSandbox resources in ``namespace``.
 
         Each item is ``{"name": <resource name = sandbox id>, "created_at":
-        <metadata.creationTimestamp parsed as an aware datetime, or None>}``.
+        <metadata.creationTimestamp parsed as an aware datetime, or None>,
+        "user_id": <from the claw-data volumeMount's subPath, or None>}``.
         """
         try:
             response = self._custom_objects_api().list_namespaced_custom_object(
@@ -108,8 +114,12 @@ class K8sClient:
             {
                 "name": metadata.get("name"),
                 "created_at": _parse_rfc3339(metadata.get("creationTimestamp")),
+                "user_id": _extract_user_id(item.get("spec")),
             }
-            for metadata in (item.get("metadata", {}) for item in response.get("items", []))
+            for item, metadata in (
+                (item, item.get("metadata", {}))
+                for item in response.get("items", [])
+            )
         ]
         logger.info("listed %d batchsandboxes in namespace %s", len(sandboxes), namespace)
         return sandboxes
@@ -152,6 +162,27 @@ class K8sClient:
             len(nodes), len(set(nodes.values())), namespace,
         )
         return nodes
+
+
+def _extract_user_id(spec: dict | None) -> str | None:
+    """Extract the user id from the claw-data volumeMount's subPath.
+
+    The subPath is ``claw/<user-id>/<image>/<version>``, so the second
+    ``/``-separated segment is the user id. A missing volume, a different
+    subPath shape, or a sandbox without that mount yields ``None``.
+    """
+    if not spec:
+        return None
+    for mount in (
+        spec.get("template", {}).get("spec", {}).get("containers", [{}])[0]
+        .get("volumeMounts", [])
+    ):
+        if mount.get("name") == _USER_VOLUME_NAME:
+            segments = mount.get("subPath", "").split("/")
+            if len(segments) >= 2 and segments[0] == "claw":
+                return segments[1]
+            return None
+    return None
 
 
 def _parse_rfc3339(value: str | None) -> datetime | None:

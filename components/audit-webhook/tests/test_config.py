@@ -14,7 +14,12 @@
 
 """Tests for the TOML config loader."""
 
+import sys
+from pathlib import Path
+
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "utils"))
 
 from config import _DEFAULTS, load_config, resolve_config_path
 
@@ -77,6 +82,38 @@ def test_partial_config_keeps_other_defaults(tmp_path):
     assert config["database_url"] == "postgresql://x"
     assert config["host"] == _DEFAULTS["host"]
     assert config["ui_password"] == _DEFAULTS["ui_password"]
+
+
+def test_default_excluded_uri_suffixes(tmp_path):
+    config = load_config(tmp_path / "nonexistent.toml")
+
+    assert config["excluded_uri_suffixes"] == ["ping"]
+
+
+def test_excluded_uri_suffixes_multiple_entries(tmp_path):
+    path = write_config(
+        tmp_path,
+        '[events]\nexcluded_uri_suffixes = ["ping", "healthz", "/status"]\n',
+    )
+
+    config = load_config(path)
+
+    assert config["excluded_uri_suffixes"] == ["ping", "healthz", "/status"]
+
+
+def test_excluded_uri_suffixes_single_string(tmp_path):
+    path = write_config(tmp_path, '[events]\nexcluded_uri_suffixes = "ping"\n')
+
+    config = load_config(path)
+
+    assert config["excluded_uri_suffixes"] == ["ping"]
+
+
+def test_excluded_uri_suffixes_invalid_type_raises(tmp_path):
+    path = write_config(tmp_path, "[events]\nexcluded_uri_suffixes = [1, 2]\n")
+
+    with pytest.raises(ValueError, match="excluded_uri_suffixes"):
+        load_config(path)
 
 
 def test_unknown_keys_and_sections_ignored(tmp_path):

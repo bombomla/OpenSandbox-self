@@ -21,14 +21,13 @@ A built-in web UI (React + Ant Design; source in `frontend/`, built
 output in `static/`) displays the records on two pages (password
 protected when `server.ui_password` is set):
 
-- `GET /` - **总表页**: per-sandbox latest requests; fuzzy search on
-  sandbox id, a date-range filter on the latest request time, sortable
-  columns (request time / request count / accessed status), and
-  auto-refresh; the node IP column shows which node each sandbox pod
-  runs on and the search box accepts a node IP to list every sandbox
-  on that node; sandboxes that exist in the cluster but were never
-  accessed are listed with an `未访问` marker; clicking a sandbox id
-  navigates to its detail page.
+- `GET /` - **总表页**: per-user summary - a user runs at most one
+  sandbox at a time, so each row pairs the user with their *current*
+  sandbox (fallback: sandboxes without a user id are their own row);
+  search on user id / sandbox id / node IP, a date-range filter on the
+  latest request time, sortable columns, and auto-refresh; clicking
+  访问详情 opens the detail page covering the user's whole sandbox
+  history (current and removed sandboxes).
 - `GET /details?sandbox_id=<id>` - **请求详情页**: request details with
   sandbox filter, pagination, and optional auto-refresh.
 - `GET /login` - password login page (session cookie, 7-day validity).
@@ -107,14 +106,16 @@ Responses:
 
 ### `GET /` (Summary Page)
 
-Web page listing the latest request per sandbox id with the total request
-count. Supports fuzzy search on sandbox id, sorting by status / creation
-time / request time / request count (click the column headers to toggle
-descending/ascending), and a date-range filter on the latest request time
-(two date pickers - start/end, both inclusive, interpreted in the
-browser's local timezone).
-Clicking a sandbox id navigates to
-`GET /details?sandbox_id=<id>` showing that sandbox's request history.
+Web page listing one row per user with their current (live) sandbox
+(a user runs at most one sandbox at a time; sandboxes without a user id
+are their own row). Supports fuzzy search on user id / sandbox id /
+node IP, sorting by status / creation time / request time / request
+count (click the column headers to toggle), and a date-range filter on
+the latest request time (two date pickers - start/end, both inclusive,
+interpreted in the browser's local timezone). Clicking a row's
+访问详情 navigates to `GET /details?user_id=<id>` (or
+`?sandbox_id=<id>` for bare sandboxes) showing the request history of
+every sandbox the user ever ran, current and removed alike.
 
 ### `GET /details` (Detail Page)
 
@@ -131,42 +132,55 @@ all existing sessions. Event ingestion is unaffected.
 
 ### `GET /api/sandboxes`
 
-List per-sandbox latest requests (summary table).
+User-grouped summary table. A user runs at most one sandbox at a time,
+so a non-deleted member set is normally one row: the summary pairs the
+user (`user_id`) with their current sandbox (`sandbox_id`), summing the
+request counts and keeping the latest request time; `sandbox_count`
+flips above 1 only in the unexpected multi-active case. Sandboxes
+without a user id fall back to per-sandbox stats (each its own row with
+`user_id: null`).
 
 Query params:
-- `search` - fuzzy-match sandbox ids (case-insensitive substring;
-  `%`/`_` in the input are matched literally) OR exact-match node
-  IPs - an IP returns every sandbox on that node
+- `search` - fuzzy-match group keys (user ids / bare sandbox ids) and
+  member sandbox ids (case-insensitive substring; `%`/`_` in the input
+  are matched literally) OR exact-match member node IPs - an IP returns
+  the groups whose sandboxes sit on that node
 - `sort` - `request_time`, `request_count`, `created_at` or `accessed`;
   prefix with `-` for descending (default: `-request_time`, newest first;
-  `accessed` ascending puts never-accessed sandboxes first)
+  `accessed` ascending puts never-accessed groups first)
 - `time_from` / `time_to` - ISO 8601 bounds on the latest request time
   (inclusive; naive values are assumed to be UTC); the summary page's
   date pickers send local start-of-day / end-of-day here
 - `limit` (1-500, default 50), `offset` (default 0)
 
 ```json
-{"total": 2, "items": [{"sandbox_id": "my-sandbox", "uri": "/ws", "method": "GET",
-  "target": "10.0.0.1:8080", "request_time": "2026-08-20T10:00:00+00:00",
-  "request_count": 2, "accessed": true, "created_at": "2026-08-20T09:00:00Z",
-  "node_ip": "10.0.0.7"}]}
+{"total": 2, "items": [
+  {"uid": "7680071018521559040", "user_id": "7680071018521559040",
+   "sandbox_count": 2, "request_time": "2026-08-20T10:00:00+00:00",
+   "request_count": 5, "accessed": true, "created_at": "2026-08-20T09:00:00Z"},
+  {"uid": "bare-sandbox", "user_id": null, "sandbox_count": 1,
+   "request_time": "2026-08-20T10:00:01+00:00", "request_count": 1,
+   "accessed": true, "created_at": null}
+]}
 ```
 
-`accessed` is `false` (and the request fields `null`, `request_count` `0`)
-on rows inserted by the cluster discovery for sandboxes that have not
-been accessed yet; they sort last under the default
-`-request_time` order.
+`accessed` is `false` (and `request_count` `0`) on groups whose members
+were all inserted by the cluster discovery and never accessed; such
+groups sort last under the default `-request_time` order.
 
 ### `GET /api/requests`
 
 List access request details, newest first.
 
-Query params: `sandbox_id` (optional filter), `limit` (1-500, default 50),
-`offset` (default 0).
+Query params: `sandbox_id` or `user_id` (optional filter - the user
+filter covers the user's *whole history*, current **and** already-removed
+sandboxes; each row carries `sandbox_deleted`), `limit` (1-500, default
+50), `offset` (default 0).
 
 ```json
-{"total": 3, "items": [{"id": 3, "sandbox_id": "other", "uri": "/", "method": "POST",
-  "target": "10.0.0.2:8080", "request_time": "2026-08-20T10:00:01+00:00",
+{"total": 3, "items": [{"id": 3, "sandbox_id": "other", "user_id": "7680071018521559040",
+  "uri": "/", "method": "POST", "target": "10.0.0.2:8080",
+  "request_time": "2026-08-20T10:00:01+00:00",
   "received_at": "2026-08-20T01:38:55+00:00"}]}
 ```
 
@@ -186,12 +200,17 @@ query APIs), accessing Kubernetes through the kubeconfig at
    sandbox flips the row to `accessed = TRUE`.
 2. The node IP of each sandbox pod (label `opensandbox.io/id`, the
    pod's `status.hostIP`) is refreshed into `node_ip`; a rescheduled
-   pod overwrites the old value.
+   pod overwrites the old value. Each BatchSandbox's `claw-data`
+   volumeMount subPath is parsed the same way into `user_id` (second
+   `/`-separated segment, e.g. `claw/7680071018521559040/...` ->
+   `7680071018521559040`); sandboxes without that mount keep their
+   previous value.
 3. The `deleted` flags are reconciled against the
    `batchsandboxes.sandbox.opensandbox.io` resource names (the resource
    name is the sandbox id): summary rows whose sandbox id is not among
-   them are marked `deleted` (still listed - the UI shows a `已删除`
-   marker); previously deleted ids that reappear are restored.
+   them are marked `deleted` (hidden from `/api/sandboxes` and the
+   summary page; their audit history stays queryable on the details
+   page); previously deleted ids that reappear are restored.
 
 Responses:
 - `200 {"namespace": "...", "live": <n>, "discovered": <n>, "backfilled": <n>, "node_updated": <n>, "deleted": <n>, "restored": <n>}`
@@ -225,9 +244,10 @@ CREATE TABLE sandbox_access_latest (
     target        TEXT,
     request_time  TIMESTAMPTZ,          -- 最新一次请求时间（未访问沙箱为 NULL）
     request_count BIGINT      NOT NULL DEFAULT 1,  -- 累计请求数
-    deleted       BOOLEAN     NOT NULL DEFAULT FALSE,  -- 沙箱资源已不存在（UI 标记为已删除）
+    deleted       BOOLEAN     NOT NULL DEFAULT FALSE,  -- 沙箱资源已不存在（总表隐藏该行）
     accessed      BOOLEAN     NOT NULL DEFAULT TRUE,   -- 集群中发现但从未访问
     node_ip       TEXT,                 -- 沙箱 pod 所在节点 IP
+    user_id       TEXT,                 -- claw-data 卷 subPath 中的用户 ID（集群同步填充）
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
@@ -245,10 +265,10 @@ Behavior notes:
   precision); the UI displays them as `YYYY-MM-DD HH:MM:SS` in the
   browser's local timezone.
 - Summary rows flagged `deleted = TRUE` (sandbox resource gone, see
-  `POST /api/sync-deleted`) stay listed in `/api/sandboxes` and the
-  summary page with `deleted: true` (a `已删除` marker), keeping the audit
-  history of removed ephemeral sandboxes searchable; existing tables are
-  migrated with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`.
+  `POST /api/sync-deleted`) are hidden from `/api/sandboxes` and the
+  summary page; the detail table keeps their history so past requests
+  remain queryable; existing tables are migrated with
+  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`.
 - Sandbox ids present on BatchSandbox resources but absent from the
   database are inserted as never-accessed rows (`accessed = FALSE`,
   NULL request fields, `created_at` = the resource's
@@ -258,6 +278,10 @@ Behavior notes:
 - `node_ip` is refreshed from each sandbox pod's `status.hostIP` on
   every sync; searching `/api/sandboxes` by a node IP returns every
   sandbox on that node.
+- `user_id` comes from each BatchSandbox's `claw-data` volumeMount
+  subPath (e.g. `claw/7680071018521559040/v20250729/...` ->
+  `7680071018521559040`) on every sync. Sandboxes without that mount or
+  a differently-shaped subPath show `null`.
 
 ## Docker
 
@@ -272,14 +296,16 @@ docker run -p 8080:8080 \
 
 ```bash
 pip install -r requirements.txt pytest httpx
-pytest test_main.py test_k8s.py test_config.py
+pytest tests
 ```
 
 Key code:
 - `main.py`: FastAPI app, routes, lifespan/pool management.
 - `store.py`: schema DDL and transactional writes.
-- `k8s.py`: kubeconfig-based BatchSandbox listing for the cluster sync.
-- `config.py`: TOML config loading (`audit.toml`, see `audit.toml.example`).
+- `utils/k8s.py`: kubeconfig-based BatchSandbox listing for the cluster sync.
+- `utils/sync.py`: cluster sync (discover/backfill/node-IP/deleted reconcile).
+- `utils/auth.py`: HMAC session-cookie helpers for the UI password.
+- `utils/config.py`: TOML config loading (`audit.toml`, see `audit.toml.example`).
 - `frontend/`: React + Vite + Ant Design SPA sources (three page entries).
 
 ## Frontend
@@ -299,4 +325,5 @@ npm run build   # regenerate ../static (commit the result with your change)
 
 After changing anything under `frontend/`, re-run `npm run build` and
 commit the regenerated `static/` output - the Docker image builds it
-itself, but `pytest test_main.py` serves the committed `static/` files.
+itself, but `pytest tests/test_main.py` serves the committed `static/`
+files.

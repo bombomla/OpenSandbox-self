@@ -20,7 +20,12 @@ clash that once made the API accessor return ``None``.
 """
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "utils"))
 
 import k8s
 
@@ -33,13 +38,30 @@ class FakeCustomObjectsApi:
         return {
             "items": [
                 {"metadata": {"name": "sb-1",
-                              "creationTimestamp": "2026-08-30T04:05:06Z"}},
+                              "creationTimestamp": "2026-08-30T04:05:06Z"},
+                 "spec": {"template": {"spec": {"containers": [{
+                     "volumeMounts": [{"name": "claw-data", "mountPath": "/opt/data",
+                                       "subPath": "claw/7680071018521559040/v20260729/2.4.6.20260831"}],
+                 }]}}}},
                 # Offset timestamps are normalized, not converted to UTC.
                 {"metadata": {"name": "sb-2",
-                              "creationTimestamp": "2026-08-30T12:00:00+08:00"}},
-                # Missing or unparseable timestamps yield None.
+                              "creationTimestamp": "2026-08-30T12:00:00+08:00"},
+                 "spec": {"template": {"spec": {"containers": [{
+                     "volumeMounts": [{"name": "claw-data",
+                                       "subPath": "claw/1234567890/latest"}],
+                 }]}}}},
+                # Missing or unparseable timestamps and missing/odd
+                # volumeMounts yield None.
                 {"metadata": {"name": "sb-3"}},
-                {"metadata": {"name": "sb-4", "creationTimestamp": "not-a-time"}},
+                {"metadata": {"name": "sb-4", "creationTimestamp": "not-a-time"},
+                 "spec": {"template": {"spec": {"containers": [{
+                     # claw-data present but not a claw/... subPath.
+                     "volumeMounts": [{"name": "claw-data", "subPath": "data"}],
+                 }]}}}},
+                {"metadata": {"name": "sb-5"},
+                 "spec": {"template": {"spec": {"containers": [{
+                     "volumeMounts": [{"name": "other", "subPath": "claw/999"}],
+                 }]}}}},
             ]
         }
 
@@ -80,7 +102,7 @@ def test_list_batch_sandboxes_parses_creation_timestamps(monkeypatch):
 
     items = client.list_batch_sandboxes("ns")
 
-    assert [item["name"] for item in items] == ["sb-1", "sb-2", "sb-3", "sb-4"]
+    assert [item["name"] for item in items] == ["sb-1", "sb-2", "sb-3", "sb-4", "sb-5"]
     assert items[0]["created_at"] == datetime(
         2026, 8, 30, 4, 5, 6, tzinfo=timezone.utc
     )
@@ -89,6 +111,23 @@ def test_list_batch_sandboxes_parses_creation_timestamps(monkeypatch):
     )
     assert items[2]["created_at"] is None
     assert items[3]["created_at"] is None
+    assert items[4]["created_at"] is None
+
+
+def test_list_batch_sandboxes_extracts_user_id(monkeypatch):
+    """The user id is the 2nd segment of the claw-data volumeMount's subPath."""
+    client = make_client(monkeypatch)
+
+    items = client.list_batch_sandboxes("ns")
+
+    assert items[0]["user_id"] == "7680071018521559040"
+    assert items[1]["user_id"] == "1234567890"
+    # No spec/volumeMounts at all.
+    assert items[2]["user_id"] is None
+    # claw-data present but subPath does not start with claw/.
+    assert items[3]["user_id"] is None
+    # A different volume named differently is ignored.
+    assert items[4]["user_id"] is None
 
 
 def test_list_sandbox_pod_nodes_uses_owner_references(monkeypatch):

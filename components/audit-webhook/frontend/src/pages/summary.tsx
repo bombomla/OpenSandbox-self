@@ -18,20 +18,24 @@ import { apiFetch, errMessage, fmtTime, logout } from "../api";
 import { mountPage } from "../app";
 
 interface SandboxRow {
+  /** group key: the user id when known, otherwise the bare sandbox id */
+  uid: string;
+  /** NULL on per-sandbox groups (sandboxes without a cluster user id) */
+  user_id: string | null;
+  /** the group's current (non-deleted) sandbox id */
   sandbox_id: string;
-  uri: string | null;
-  method: string | null;
-  target: string | null;
-  request_time: string | null;
-  request_count: number;
-  /** false = discovered in the cluster, no request recorded yet */
-  accessed: boolean;
-  /** BatchSandbox creationTimestamp, set on discovery-inserted rows */
-  created_at: string | null;
-  /** IP of the node the sandbox pod runs on (synced from the cluster) */
+  /** node IP of the current sandbox's pod (synced from the cluster) */
   node_ip: string | null;
-  /** sandbox resource no longer exists in the cluster (已删除 marker) */
-  deleted: boolean;
+  /** number of non-deleted sandbox members in this group */
+  sandbox_count: number;
+  /** false = every member discovered in the cluster, no request yet */
+  accessed: boolean;
+  /** earliest member BatchSandbox creationTimestamp */
+  created_at: string | null;
+  /** latest member request time */
+  request_time: string | null;
+  /** summed member request count */
+  request_count: number;
 }
 
 const { RangePicker } = DatePicker;
@@ -47,16 +51,6 @@ const DEFAULT_SORT = "-request_time";
  * clicked column.
  */
 const SORT_DIRECTIONS = ["descend", "ascend", "descend"] as const;
-
-const METHOD_COLORS: Record<string, string> = {
-  GET: "green",
-  POST: "blue",
-  PUT: "orange",
-  DELETE: "red",
-  PATCH: "purple",
-  HEAD: "default",
-  OPTIONS: "default",
-};
 
 function SummaryPage() {
   const [rows, setRows] = useState<SandboxRow[]>([]);
@@ -149,18 +143,16 @@ function SummaryPage() {
 
   const columns: ColumnsType<SandboxRow> = [
     {
-      title: "沙箱 ID",
+      title: "用户 ID",
+      dataIndex: "uid",
+      key: "uid",
+      render: (id: string) => id,
+    },
+    {
+      title: "当前沙箱 ID",
       dataIndex: "sandbox_id",
       key: "sandbox_id",
-      render: (id: string) => (
-        <Typography.Link
-          onClick={() => {
-            window.location.href = `/details?sandbox_id=${encodeURIComponent(id)}`;
-          }}
-        >
-          {id}
-        </Typography.Link>
-      ),
+      render: (id: string) => <Typography.Text copyable={{ text: id }}>{id}</Typography.Text>,
     },
     {
       title: "状态",
@@ -171,10 +163,8 @@ function SummaryPage() {
       sortDirections: [...SORT_DIRECTIONS],
       sortOrder:
         sort === "accessed" ? "ascend" : sort === "-accessed" ? "descend" : null,
-      render: (accessed: boolean, row: SandboxRow) =>
-        row.deleted ? (
-          <Tag color="red">已删除</Tag>
-        ) : accessed ? (
+      render: (accessed: boolean) =>
+        accessed ? (
           <Tag color="green">已访问</Tag>
         ) : (
           <Tag color="orange">未访问</Tag>
@@ -199,26 +189,6 @@ function SummaryPage() {
       render: (ip: string | null) => ip ?? "-",
     },
     {
-      title: "方法",
-      dataIndex: "method",
-      key: "method",
-      width: 90,
-      render: (method: string | null) =>
-        method ? (
-          <Tag color={METHOD_COLORS[method.toUpperCase()] ?? "default"}>
-            {method}
-          </Tag>
-        ) : (
-          "-"
-        ),
-    },
-    {
-      title: "目标",
-      dataIndex: "target",
-      key: "target",
-      render: (target: string | null) => target ?? "-",
-    },
-    {
       title: "最新请求时间",
       dataIndex: "request_time",
       key: "request_time",
@@ -240,12 +210,30 @@ function SummaryPage() {
         sort === "request_count" ? "ascend" : sort === "-request_count" ? "descend" : null,
       render: (count: number) => <Tag color="geekblue">{count}</Tag>,
     },
+    {
+      title: "操作",
+      key: "action",
+      width: 110,
+      render: (_: unknown, row: SandboxRow) => (
+        <Typography.Link
+          onClick={() => {
+            window.location.href = `/details?${
+              row.user_id
+                ? `user_id=${encodeURIComponent(row.user_id)}`
+                : `sandbox_id=${encodeURIComponent(row.uid)}`
+            }`;
+          }}
+        >
+          访问详情
+        </Typography.Link>
+      ),
+    },
   ];
 
   return (
     <>
       <header className="app-header">
-        <h1>OpenSandbox 沙箱最新请求（总表）</h1>
+        <h1>OpenSandbox 用户访问总表</h1>
         <Space>
           <label>
             自动刷新（10s）{" "}
@@ -261,12 +249,12 @@ function SummaryPage() {
         <div className="table-card">
           <div className="table-toolbar">
             <Input.Search
-              placeholder="按沙箱 ID 模糊搜索，或输入节点 IP 精确查询"
+              placeholder="按用户 ID / 沙箱 ID 模糊搜索，或输入节点 IP 精确查询"
               allowClear
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
               onSearch={applySearch}
-              style={{ width: 300 }}
+              style={{ width: 320 }}
             />
             <RangePicker
               placeholder={["最新请求开始日期", "结束日期"]}
@@ -281,12 +269,14 @@ function SummaryPage() {
             <Typography.Text type="secondary">共 {total} 条</Typography.Text>
           </div>
           <p className="hint">
-            点击沙箱 ID 查看该沙箱的请求详情；点击「状态」/「创建时间」/「最新请求时间」/「累计请求数」表头排序（降序 ↔ 升序循环）；
-            「未访问」表示沙箱存在于集群但尚无访问记录；「已删除」表示沙箱资源已从集群移除（访问记录保留可查）；
-            搜索框输入节点 IP 可查到该节点上的所有沙箱
+            一个用户同一时间最多运行一个沙箱：每行显示用户及其当前沙箱；无用户 ID 的沙箱单独一行。
+            累计请求数为该组所有沙箱之和，最新请求时间取最近一次。点击「访问详情」查看该用户（含历史沙箱）的请求记录；
+            点击「状态」/「创建时间」/「最新请求时间」/「累计请求数」表头排序（降序 ↔ 升序循环）；
+            「未访问」表示沙箱存在于集群但尚无访问记录；已从集群移除的沙箱不再显示（其访问记录在详情页仍可查询）；
+            搜索框输入节点 IP 可查到该节点上沙箱所属的分组
           </p>
           <Table<SandboxRow>
-            rowKey="sandbox_id"
+            rowKey="uid"
             columns={columns}
             dataSource={rows}
             loading={loading}

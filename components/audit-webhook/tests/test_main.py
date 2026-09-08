@@ -17,9 +17,19 @@
 Uses a fake store so no PostgreSQL instance is required.
 """
 
+import sys
+from pathlib import Path
+
 import pytest
 from datetime import datetime, timezone
 from fastapi.testclient import TestClient
+
+# Tests live in tests/; the webhook sources are one level up (main.py,
+# store.py) with helpers in utils/.
+_ROOT = Path(__file__).resolve().parent.parent
+for _path in (str(_ROOT), str(_ROOT / "utils")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 import main
 from store import _normalize
@@ -35,6 +45,7 @@ class FakeStore:
         # backfill in upsert_discovered_sandboxes.
         self.created_at = {}
         self.node_ips = {}  # sandbox_id -> node IP
+        self.user_ids = {}  # sandbox_id -> user id
 
     def init_schema(self):
         pass
@@ -64,12 +75,25 @@ class FakeStore:
             and self.created_at[sandbox["name"]] is None
             and sandbox.get("created_at") is not None
         ]
+        user_backfilled = [
+            sandbox
+            for sandbox in sandboxes
+            if sandbox["name"] in self.user_ids
+            and self.user_ids[sandbox["name"]] is None
+            and sandbox.get("user_id") is not None
+        ]
         for sandbox in discovered:
             self.created_at[sandbox["name"]] = sandbox.get("created_at")
             self.unaccessed[sandbox["name"]] = sandbox.get("created_at")
         for sandbox in backfilled:
             self.created_at[sandbox["name"]] = sandbox["created_at"]
-        return {"discovered": len(discovered), "backfilled": len(backfilled)}
+        for sandbox in sandboxes:
+            if sandbox.get("user_id") is not None:
+                self.user_ids.setdefault(sandbox["name"], sandbox["user_id"])
+        return {
+            "discovered": len(discovered),
+            "backfilled": len(backfilled) + len(user_backfilled),
+        }
 
     def update_node_ips(self, nodes):
         if self.fail:
@@ -83,6 +107,13 @@ class FakeStore:
         for sandbox_id in changed:
             self.node_ips[sandbox_id] = nodes[sandbox_id]
         return len(changed)
+
+    def _user_of(self, sandbox_id):
+        # uid = user_id when known, else the bare sandbox id.
+        return self.user_ids.get(sandbox_id, sandbox_id)
+
+    def is_deleted(self, sandbox_id):
+        return sandbox_id in self.deleted_ids
 
     def list_latest(
         self,
@@ -99,49 +130,89 @@ class FakeStore:
         def matches_search(sandbox_id):
             if search is None:
                 return True
-            # Mimic the SQL: fuzzy on sandbox_id OR exact on node_ip.
+            # Mimic the SQL: fuzzy on user id/sandbox id (any member) OR
+            # exact on node_ip.
+            uid = self._user_of(sandbox_id)
             return (
-                search.lower() in sandbox_id.lower()
+                search.lower() in uid.lower()
+                or search.lower() in sandbox_id.lower()
                 or self.node_ips.get(sandbox_id) == search
             )
 
-        items = [
-            {
-                "sandbox_id": event["sandbox_id"],
-                "uri": event["uri"],
-                "method": event["method"],
-                "target": event["target"],
-                "request_time": event["request_time"],
-                "request_count": 1,
-                "accessed": True,
-                "created_at": self.created_at.get(event["sandbox_id"]),
-                "node_ip": self.node_ips.get(event["sandbox_id"]),
-                "deleted": event["sandbox_id"] in self.deleted_ids,
+        def member_row(sandbox_id: str, request_time) -> dict:
+            unaccessed = request_time is None
+            return {
+                "sandbox_id": sandbox_id,
+                "request_time": request_time,
+                "request_count": 0 if unaccessed else 1,
+                "accessed": not unaccessed,
+                "created_at": self.created_at.get(sandbox_id),
+                "node_ip": self.node_ips.get(sandbox_id),
+                "user_id": self.user_ids.get(sandbox_id),
             }
-            for event in self.events
-            if matches_search(event["sandbox_id"])
-            and (time_from is None or time_from <= event["request_time"])
-            and (time_to is None or event["request_time"] <= time_to)
-        ]
+
+        seen: set[str] = set()
+        members: list[dict] = []
+        for event in self.events:
+            sandbox_id = event["sandbox_id"]
+            if sandbox_id in seen or self.is_deleted(sandbox_id):
+                continue
+            if not matches_search(sandbox_id):
+                continue
+            if time_from is not None and event["request_time"] < time_from:
+                continue
+            if time_to is not None and event["request_time"] > time_to:
+                continue
+            members.append(member_row(sandbox_id, event["request_time"]))
+            seen.add(sandbox_id)
         # Discovered-but-never-accessed rows: NULL request fields, count 0.
         # Time filters exclude them (NULL comparisons are not TRUE in SQL).
         if time_from is None and time_to is None:
-            items.extend(
+            for sandbox_id, _created_at in self.unaccessed.items():
+                if (
+                    sandbox_id in seen
+                    or self.is_deleted(sandbox_id)
+                    or not matches_search(sandbox_id)
+                ):
+                    continue
+                members.append(member_row(sandbox_id, None))
+                seen.add(sandbox_id)
+        # Group by user: uid = user_id when known, else the sandbox id.
+        # Member request_count sums every recorded event (SUM over rows).
+        counts: dict[str, int] = {}
+        for event in self.events:
+            sb = event["sandbox_id"]
+            if not self.is_deleted(sb):
+                counts[sb] = counts.get(sb, 0) + 1
+        groups: dict[str, dict] = {}
+        for m in members:
+            uid = self._user_of(m["sandbox_id"])
+            group = groups.setdefault(
+                uid,
                 {
-                    "sandbox_id": sandbox_id,
-                    "uri": None,
-                    "method": None,
-                    "target": None,
+                    "uid": uid,
+                    "user_id": m["user_id"],
+                    "sandbox_id": m["sandbox_id"],
+                    "node_ip": m["node_ip"],
+                    "sandbox_count": 0,
+                    "accessed": True,
+                    "created_at": None,
                     "request_time": None,
                     "request_count": 0,
-                    "accessed": False,
-                    "created_at": created_at,
-                    "node_ip": self.node_ips.get(sandbox_id),
-                    "deleted": sandbox_id in self.deleted_ids,
-                }
-                for sandbox_id, created_at in self.unaccessed.items()
-                if matches_search(sandbox_id)
+                },
             )
+            group["sandbox_count"] += 1
+            group["accessed"] = group["accessed"] and m["accessed"]
+            if m["created_at"] and (
+                group["created_at"] is None or m["created_at"] < group["created_at"]
+            ):
+                group["created_at"] = m["created_at"]
+            if m["request_time"] and (
+                group["request_time"] is None or m["request_time"] > group["request_time"]
+            ):
+                group["request_time"] = m["request_time"]
+            group["request_count"] += counts.get(m["sandbox_id"], 0)
+        items = list(groups.values())
         return {
             "total": len(items),
             "items": items[offset : offset + limit],
@@ -149,14 +220,33 @@ class FakeStore:
             "search": search,
         }
 
-    def list_details(self, sandbox_id=None, limit=50, offset=0):
+    def list_details(self, sandbox_id=None, user_id=None, limit=50, offset=0):
         if self.fail:
             raise RuntimeError("db down")
-        matches = [
-            event for event in self.events if sandbox_id is None or event["sandbox_id"] == sandbox_id
-        ]
+        if user_id is not None:
+            # History: all of the user's sandboxes, deleted ones included.
+            member_ids = {
+                sb for sb, uid in self.user_ids.items() if uid == user_id
+            }
+            matches = [
+                event
+                for event in self.events
+                if event["sandbox_id"] in member_ids
+            ]
+        else:
+            matches = [
+                event
+                for event in self.events
+                if sandbox_id is None or event["sandbox_id"] == sandbox_id
+            ]
         items = [
-            {"id": index + 1, "received_at": event["request_time"], **event}
+            {
+                "id": index + 1,
+                "received_at": event["request_time"],
+                "user_id": self.user_ids.get(event["sandbox_id"]),
+                "sandbox_deleted": event["sandbox_id"] in self.deleted_ids,
+                **event,
+            }
             for index, event in enumerate(matches[offset : offset + limit])
         ]
         return {"total": len(matches), "items": items}
@@ -265,6 +355,38 @@ def test_ping_requests_not_recorded(client):
     )
 
 
+def test_query_values_ignored_in_exclusion(monkeypatch):
+    """Query-string values are not matched: /usage?days= covers days=<any>.
+
+    The default suffix list is ping-only, so the test pins its own list
+    (audit.toml's real list varies per developer).
+    """
+    from main import _should_record, AuditEvent
+
+    def event(uri):
+        return AuditEvent(
+            sandbox_id="sb", uri=uri, method="GET", target="t",
+            request_time="2026-09-07T00:00:00Z",
+        )
+
+    with monkeypatch.context() as m:
+        m.setattr("main._EXCLUDED_URI_SUFFIXES", ("/usage?days=",))
+        # Any days value is excluded - the value is ignored during matching.
+        assert not _should_record(event("/sb/9119/usage?days=1"))
+        assert not _should_record(event("/sb/9119/usage?days=2"))
+        assert not _should_record(event("/sb/9119/usage?days=30"))
+        assert not _should_record(event("/sb/9119/usage?days"))
+        # Extra params after it: the value-less name still ends the URI.
+        assert not _should_record(event("/sb/9119/usage?days=1&fmt=json"))
+        # Different query name is recorded.
+        assert _should_record(event("/sb/9119/usage?since=1"))
+        # Path-only suffixes keep matching.
+        m.setattr("main._EXCLUDED_URI_SUFFIXES", ("ping",))
+        assert not _should_record(event("/sb/9119/ping"))
+        assert not _should_record(event("/sb/9119/ping?x=1"))
+        assert _should_record(event("/sb/9119/pong?x=1"))
+
+
 def test_reject_invalid_event(client):
     test_client, fake = client
 
@@ -370,6 +492,7 @@ def test_auth_disabled_by_default(client):
 
 
 def test_list_sandboxes(client):
+    """Without user ids, each sandbox is its own summary group."""
     test_client, fake = client
     fake.record([EVENT, {**EVENT, "sandbox_id": "other"}])
 
@@ -379,7 +502,10 @@ def test_list_sandboxes(client):
     data = response.json()
     assert data["total"] == 2
     assert len(data["items"]) == 2
-    assert data["items"][0]["sandbox_id"] == "test-sandbox"
+    by_uid = {item["uid"]: item for item in data["items"]}
+    assert by_uid["test-sandbox"]["user_id"] is None
+    assert by_uid["test-sandbox"]["request_count"] == 1
+    assert by_uid["test-sandbox"]["sandbox_count"] == 1
 
 
 def test_list_sandboxes_fuzzy_search(client):
@@ -391,7 +517,7 @@ def test_list_sandboxes_fuzzy_search(client):
     assert response.status_code == 200
     data = response.json()
     assert data["total"] == 1
-    assert data["items"][0]["sandbox_id"] == "test-sandbox"
+    assert data["items"][0]["uid"] == "test-sandbox"
 
 
 def test_list_sandboxes_sort(client):
@@ -441,14 +567,67 @@ def test_list_sandboxes_time_range_filter(client):
     assert response.status_code == 200
     data = response.json()
     assert data["total"] == 1
-    assert data["items"][0]["sandbox_id"] == "test-sandbox"
+    assert data["items"][0]["uid"] == "test-sandbox"
 
     # The bounds are inclusive and can be used alone.
     response = test_client.get(
         "/api/sandboxes", params={"time_from": "2026-08-21T01:24:12Z"}
     )
     assert response.json()["total"] == 1
-    assert response.json()["items"][0]["sandbox_id"] == "newer"
+    assert response.json()["items"][0]["uid"] == "newer"
+
+
+def test_list_sandboxes_groups_by_user(client):
+    """Sandboxes sharing a user_id roll into one summed group."""
+    test_client, fake = client
+    # Two sandboxes for user u-1, one bare sandbox without a user id.
+    fake.user_ids = {"sb-a": "u-1", "sb-b": "u-1"}
+    fake.record([EVENT | {"sandbox_id": "sb-a"},
+                 EVENT | {"sandbox_id": "sb-b"}])
+    fake.record([{**EVENT, "sandbox_id": "sb-c"}])
+    fake.record([{**EVENT, "sandbox_id": "sb-a"}])
+
+    response = test_client.get("/api/sandboxes")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    groups = {item["uid"]: item for item in data["items"]}
+    user_group = groups["u-1"]
+    assert user_group["user_id"] == "u-1"
+    assert user_group["sandbox_count"] == 2
+    # Summed across both sandboxes, including the repeat event.
+    assert user_group["request_count"] == 3
+    bare = groups["sb-c"]
+    assert bare["user_id"] is None
+    assert bare["request_count"] == 1
+
+    # Searching by member sandbox id finds the user group.
+    response = test_client.get("/api/sandboxes", params={"search": "sb-b"})
+    assert response.json()["total"] == 1
+    assert response.json()["items"][0]["uid"] == "u-1"
+
+
+def test_list_requests_filter_by_user(client):
+    """user_id on /api/requests returns every request of the user's sandboxes."""
+    test_client, fake = client
+    fake.user_ids = {"sb-a": "u-1", "sb-b": "u-1"}
+    fake.record([EVENT | {"sandbox_id": "sb-a"},
+                 EVENT | {"sandbox_id": "sb-b"},
+                 EVENT | {"sandbox_id": "sb-c"}])
+
+    response = test_client.get("/api/requests", params={"user_id": "u-1"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    assert {item["sandbox_id"] for item in data["items"]} == {"sb-a", "sb-b"}
+    assert all(item["user_id"] == "u-1" for item in data["items"])
+
+    # Sandbox filter still works and carries the user_id.
+    response = test_client.get("/api/requests", params={"sandbox_id": "sb-c"})
+    assert response.json()["total"] == 1
+    assert response.json()["items"][0]["user_id"] is None
 
 
 def test_list_sandboxes_rejects_invalid_time_range(client):
@@ -519,6 +698,42 @@ def test_normalize_truncates_to_seconds():
     assert event["request_time"].isoformat() == "2026-08-20T09:24:12+08:00"
 
 
+def test_summary_shows_user_current_sandbox(client):
+    """The summary row pairs each user with their current (live) sandbox."""
+    test_client, fake = client
+    # User u-1's current sandbox; a second lean event keeps it live.
+    fake.user_ids = {"sb-a": "u-1"}
+    fake.record([EVENT | {"sandbox_id": "sb-a"}])
+
+    response = test_client.get("/api/sandboxes")
+
+    assert response.status_code == 200
+    (row,) = response.json()["items"]
+    assert row["uid"] == "u-1"
+    assert row["user_id"] == "u-1"
+    assert row["sandbox_id"] == "sb-a"
+    assert row["sandbox_count"] == 1
+
+
+def test_user_details_include_deleted_history(client):
+    """/api/requests?user_id= covers removed sandboxes too, flagged."""
+    test_client, fake = client
+    fake.user_ids = {"sb-old": "u-1", "sb-new": "u-1"}
+    fake.record([EVENT | {"sandbox_id": "sb-old"}])
+    fake.deleted_ids.add("sb-old")  # the sync removed the old sandbox
+    fake.record([EVENT | {"sandbox_id": "sb-new"}])
+
+    response = test_client.get("/api/requests", params={"user_id": "u-1"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    by_sandbox = {item["sandbox_id"]: item for item in data["items"]}
+    assert by_sandbox["sb-old"]["sandbox_deleted"] is True
+    assert by_sandbox["sb-new"]["sandbox_deleted"] is False
+    assert all(item["user_id"] == "u-1" for item in data["items"])
+
+
 class FakeK8sClient:
     def __init__(self, names, created_at=None, pod_nodes=None):
         self.names = names
@@ -557,14 +772,12 @@ def test_sync_deleted_marks_missing_sandboxes(monkeypatch, client):
     assert data["restored"] == 0
     assert fake.deleted_ids == {"other"}
 
-    # Deleted sandboxes stay listed, flagged deleted=true (已删除 in the UI),
-    # so their audit history remains searchable.
+    # Deleted sandboxes no longer appear in the summary listing (已删除
+    # rows are hidden); their audit history stays on the details page.
     listing = test_client.get("/api/sandboxes")
     assert listing.status_code == 200
-    assert listing.json()["total"] == 2
-    by_id = {item["sandbox_id"]: item for item in listing.json()["items"]}
-    assert by_id["test-sandbox"]["deleted"] is False
-    assert by_id["other"]["deleted"] is True
+    assert listing.json()["total"] == 1
+    assert [i["uid"] for i in listing.json()["items"]] == ["test-sandbox"]
 
 
 def test_sync_deleted_restores_reappeared_sandbox(monkeypatch, client):
@@ -645,11 +858,10 @@ def test_sync_discovers_unaccessed_sandboxes(monkeypatch, client):
     # carrying the BatchSandbox creationTimestamp.
     listing = test_client.get("/api/sandboxes")
     assert listing.status_code == 200
-    items = {item["sandbox_id"]: item for item in listing.json()["items"]}
+    items = {item["uid"]: item for item in listing.json()["items"]}
     assert set(items) == {"test-sandbox", "fresh"}
     assert items["fresh"]["accessed"] is False
     assert items["fresh"]["request_count"] == 0
-    assert items["fresh"]["uri"] is None
     assert items["fresh"]["request_time"] is None
     assert items["fresh"]["created_at"] == "2026-08-30T04:05:06Z"
     assert items["test-sandbox"]["accessed"] is True
@@ -686,12 +898,11 @@ def test_sync_backfills_creation_timestamp(monkeypatch, client):
     assert data["backfilled"] == 1
 
     items = {
-        item["sandbox_id"]: item
+        item["uid"]: item
         for item in test_client.get("/api/sandboxes").json()["items"]
     }
     assert items["test-sandbox"]["created_at"] == "2026-08-19T08:30:00Z"
     assert items["test-sandbox"]["accessed"] is True
-    assert items["test-sandbox"]["uri"] == EVENT["uri"]
 
     # Re-syncing with the same timestamp backfills nothing more.
     main.app.state.k8s_client = fake_k8s
@@ -721,18 +932,12 @@ def test_sync_updates_node_ips(monkeypatch, client):
     data = response.json()
     assert data["node_updated"] == 2
 
-    items = {
-        item["sandbox_id"]: item
-        for item in test_client.get("/api/sandboxes").json()["items"]
-    }
-    assert items["test-sandbox"]["node_ip"] == "10.0.0.1"
-    assert items["other"]["node_ip"] == "10.0.0.2"
-
-    # Searching by node IP returns every sandbox on that node.
+    # The summary groups don't carry node_ip (a user may span nodes), but
+    # searching by node IP finds the group whose member sits on that node.
     listing = test_client.get("/api/sandboxes", params={"search": "10.0.0.1"})
     assert listing.status_code == 200
     assert listing.json()["total"] == 1
-    assert listing.json()["items"][0]["sandbox_id"] == "test-sandbox"
+    assert listing.json()["items"][0]["uid"] == "test-sandbox"
 
     # A rescheduled pod (new host IP) overwrites the old value; unchanged
     # rows are not counted again.
@@ -743,11 +948,9 @@ def test_sync_updates_node_ips(monkeypatch, client):
     finally:
         main.app.state.k8s_client = None
     assert response.json()["node_updated"] == 1
-    items = {
-        item["sandbox_id"]: item
-        for item in test_client.get("/api/sandboxes").json()["items"]
-    }
-    assert items["test-sandbox"]["node_ip"] == "10.0.0.9"
+    listing = test_client.get("/api/sandboxes", params={"search": "10.0.0.9"})
+    assert listing.json()["total"] == 1
+    assert listing.json()["items"][0]["uid"] == "test-sandbox"
 
 
 def test_search_by_ip_finds_unaccessed_sandboxes(monkeypatch, client):
@@ -761,8 +964,7 @@ def test_search_by_ip_finds_unaccessed_sandboxes(monkeypatch, client):
 
     assert listing.status_code == 200
     assert listing.json()["total"] == 1
-    assert listing.json()["items"][0]["sandbox_id"] == "fresh"
-    assert listing.json()["items"][0]["node_ip"] == "10.0.0.5"
+    assert listing.json()["items"][0]["uid"] == "fresh"
 
 
 def test_discovered_sandbox_becomes_accessed_on_first_event(monkeypatch, client):
@@ -772,7 +974,7 @@ def test_discovered_sandbox_becomes_accessed_on_first_event(monkeypatch, client)
     fake.upsert_discovered_sandboxes([{"name": "fresh", "created_at": None}])
 
     items = {
-        item["sandbox_id"]: item
+        item["uid"]: item
         for item in test_client.get("/api/sandboxes").json()["items"]
     }
     assert items["fresh"]["accessed"] is False
@@ -780,8 +982,7 @@ def test_discovered_sandbox_becomes_accessed_on_first_event(monkeypatch, client)
     test_client.post("/events", json={**EVENT, "sandbox_id": "fresh"})
 
     items = {
-        item["sandbox_id"]: item
+        item["uid"]: item
         for item in test_client.get("/api/sandboxes").json()["items"]
     }
     assert items["fresh"]["accessed"] is True
-    assert items["fresh"]["uri"] == EVENT["uri"]

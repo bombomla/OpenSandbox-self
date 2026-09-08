@@ -4,3 +4,7 @@ config
 
 # Frontend build inputs/outputs
 frontend/node_modules/
+
+# Python caches (config.py/k8s.py live in utils/, bytecode lands next to them)
+__pycache__/
+.pytest_cache/

@@ -12,19 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Sandbox access audit webhook.
+"""Sandbox access audit webhook (entry point).
 
 Receives audit events POSTed by the OpenSandbox ingress
-(`--audit-enabled --audit-webhook-url ...`) and records them to
-PostgreSQL: a detail row per request plus a per-sandbox summary row
-holding the latest request.
-
-A periodic Kubernetes sync (``kubernetes.sync_interval``) also discovers
-BatchSandbox resources whose sandbox id has no database row yet and
-inserts them as never-accessed rows, visible in the UI with an ``未访问``
-marker; rows whose sandbox resource is gone are flagged ``deleted`` and
-shown with a ``已删除`` marker (the audit history of removed ephemeral
-sandboxes stays searchable).
+(``--audit-enabled --audit-webhook-url ...``) and records them to
+PostgreSQL via ``store.py``. Cluster sync lives in ``utils/sync.py``,
+session auth in ``utils/auth.py``.
 
 Web UI (password protected when ``server.ui_password`` is set):
 - ``GET /``          - per-sandbox latest requests (summary page)
@@ -37,15 +30,17 @@ Run:
 """
 
 import asyncio
-import hashlib
-import hmac
 import logging
 import secrets
-import time
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Union
+
+# The config/k8s helpers live in ./utils - add it to sys.path so the module
+# works when run directly (python main.py) and under pytest.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "utils"))
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
@@ -54,8 +49,16 @@ from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
 
 import k8s
+from auth import (
+    SESSION_COOKIE as _SESSION_COOKIE,
+    LoginRequest,
+    create_session_token,
+    session_token_from,
+    valid_session,
+)
 from config import load_config
 from store import AuditStore
+from sync import sync_sandboxes as _sync_sandboxes
 
 # Settings come from audit.toml (see audit.toml.example); the config file
 # location can be overridden with the AUDIT_CONFIG_PATH env var.
@@ -90,7 +93,6 @@ KUBECONFIG_PATH = _config["kubeconfig"]
 K8S_NAMESPACE = _config["k8s_namespace"]
 K8S_SYNC_INTERVAL = _config["k8s_sync_interval"]
 
-_SESSION_COOKIE = "audit_session"
 _SESSION_TTL = 7 * 24 * 3600  # 7 days, in seconds
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -106,10 +108,6 @@ class AuditEvent(BaseModel):
 
 class AuditEventAccepted(BaseModel):
     accepted: int
-
-
-class LoginRequest(BaseModel):
-    password: str
 
 
 @asynccontextmanager
@@ -161,39 +159,12 @@ async def _periodic_sync(store: AuditStore) -> None:
     while True:
         try:
             result = await asyncio.to_thread(
-                _sync_sandboxes, store, app.state.k8s_client
+                _sync_sandboxes, store, app.state.k8s_client, K8S_NAMESPACE
             )
             logger.info("periodic sync: %s", result)
         except Exception:
             logger.exception("periodic sandbox sync failed")
         await asyncio.sleep(K8S_SYNC_INTERVAL)
-
-
-def _sync_sandboxes(store: AuditStore, k8s_client: k8s.K8sClient) -> dict:
-    """Discover unaccessed sandboxes, refresh node IPs, and reconcile the
-    ``deleted`` flags.
-
-    The BatchSandbox resource name is the sandbox id. Sandbox ids that
-    exist in the cluster but have no summary row are inserted as
-    never-accessed rows carrying the resource's creationTimestamp
-    (shown in the UI with an ``未访问`` marker); existing rows missing a
-    creation timestamp get it backfilled. The ``node_ip`` of every
-    sandbox pod's host is refreshed. Rows whose sandbox id is gone from
-    the cluster are flagged deleted.
-    """
-    sandboxes = k8s_client.list_batch_sandboxes(K8S_NAMESPACE)
-    discovered = store.upsert_discovered_sandboxes(sandboxes)
-    node_updated = store.update_node_ips(
-        k8s_client.list_sandbox_pod_nodes(K8S_NAMESPACE)
-    )
-    names = [sandbox["name"] for sandbox in sandboxes]
-    result = store.sync_deleted_flags(names)
-    return {
-        "live": len(sandboxes),
-        "node_updated": node_updated,
-        **discovered,
-        **result,
-    }
 
 
 app = FastAPI(
@@ -210,39 +181,21 @@ app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 # Authentication
 # ---------------------------------------------------------------------------
 
-def _session_secret() -> bytes:
-    """Derive the signing key from the password (sessions reset on change)."""
-    return hashlib.sha256(("audit-webhook:" + UI_PASSWORD).encode()).digest()
-
-
-def _sign(expires: int) -> str:
-    return hmac.new(_session_secret(), str(expires).encode(), hashlib.sha256).hexdigest()
-
-
-def _create_session_token() -> str:
-    expires = int(time.time()) + _SESSION_TTL
-    return f"{expires}.{_sign(expires)}"
-
-
 def _valid_session(token: str | None) -> bool:
-    if UI_PASSWORD == "":
-        return True  # auth disabled
-    if not token:
-        return False
-    expires, _, signature = token.partition(".")
-    if not signature or not expires.isdigit():
-        return False
-    if int(expires) < time.time():
-        return False
-    return hmac.compare_digest(signature, _sign(int(expires)))
+    return valid_session(UI_PASSWORD, token)
 
 
 def _session_token(request: Request) -> str | None:
-    return request.cookies.get(_SESSION_COOKIE)
+    return session_token_from(request.cookies)
 
 
 def _login_redirect() -> RedirectResponse:
     return RedirectResponse("/login", status_code=303)
+
+
+def _require_api_auth(request: Request) -> None:
+    if UI_PASSWORD and not _valid_session(_session_token(request)):
+        raise HTTPException(status_code=401, detail="login required")
 
 
 @app.get("/login", response_class=HTMLResponse, include_in_schema=False)
@@ -260,7 +213,7 @@ def login(body: LoginRequest, request: Request) -> JSONResponse:
     response = JSONResponse({"ok": True})
     response.set_cookie(
         _SESSION_COOKIE,
-        _create_session_token(),
+        create_session_token(UI_PASSWORD, _SESSION_TTL),
         max_age=_SESSION_TTL,
         httponly=True,
         samesite="lax",
@@ -300,9 +253,14 @@ def record_events(
     ``POST /`` is accepted as an alias for ``POST /events`` so a webhook
     URL configured without the path still works.
 
-    Requests whose URI ends with "ping" (case-insensitive, e.g.
-    `/<sandbox-id>/<port>/ping` health checks) are dropped and not
-    recorded to the database.
+    Requests whose URI ends with any suffix from
+    ``[events] excluded_uri_suffixes`` (case-insensitive, default
+    ``["ping"]`` - e.g. `/<sandbox-id>/<port>/ping` health checks) are
+    dropped and not recorded to the database.
+
+    For URIs with a query string, only the parameter names are matched -
+    values are ignored - so one entry ``/usage?days=`` covers every
+    ``/usage?days=<any value>``.
     """
     if not isinstance(events, list):
         events = [events]
@@ -317,14 +275,56 @@ def record_events(
     return AuditEventAccepted(accepted=accepted)
 
 
-# Requests whose URI ends with this suffix (case-insensitive) are not
-# recorded - typically liveness/health-check pings, e.g.
-# /610c205a-272e-425f-85bf-b27cae2d9ee3/44772/ping
-_EXCLUDED_URI_SUFFIX = "ping"
+# Requests whose URI ends with any of these suffixes (case-insensitive) are
+# not recorded - typically liveness/health-check pings, e.g.
+# /610c205a-272e-425f-85bf-b27cae2d9ee3/44772/ping. Configurable via the
+# [events] excluded_uri_suffixes key in audit.toml.
+#
+# An entry may carry query parameter names (e.g. ``/usage?days=``): it
+# then matches any URI whose path ends with the entry's path part and
+# whose query parameter names match - values are ignored, so one entry
+# covers ``/usage?days=1``, ``/usage?days=30`` and ``/usage?days=1&x=2``.
+_EXCLUDED_URI_SUFFIXES = tuple(
+    suffix.lower() for suffix in _config["excluded_uri_suffixes"]
+)
+
+
+def _query_names(uri: str) -> tuple[str, tuple[str, ...]]:
+    """Split a URI into its lowercased path and its query parameter names.
+
+    ``/Usage?Days=2&fmt=json`` -> ``("/usage", ("days", "fmt"))``.
+    """
+    path, _, query = uri.partition("?")
+    names = tuple(
+        part.partition("=")[0].lower()
+        for part in query.split("&")
+        if part and part.partition("=")[0]
+    )
+    return path.lower(), names
 
 
 def _should_record(event: AuditEvent) -> bool:
-    return not event.uri.lower().endswith(_EXCLUDED_URI_SUFFIX)
+    path, names = _query_names(event.uri)
+    for suffix in _EXCLUDED_URI_SUFFIXES:
+        suffix_path, _, suffix_query = suffix.partition("?")
+        if not suffix_query:
+            # Plain path suffix match.
+            if path.endswith(suffix_path):
+                return False
+        else:
+            # Path suffix + query parameter names (values ignored).
+            suffix_names = tuple(
+                name.rstrip("=")
+                for name in suffix_query.split("&")
+                if name.rstrip("=")
+            )
+            if (
+                path.endswith(suffix_path)
+                and names
+                and all(name in names for name in suffix_names)
+            ):
+                return False
+    return True
 
 
 @app.get("/status.ok")
@@ -349,17 +349,12 @@ def list_sandboxes(
     time_from: Annotated[datetime | None, Query()] = None,
     time_to: Annotated[datetime | None, Query()] = None,
 ) -> dict:
-    """List per-sandbox latest requests.
+    """List per-user/per-sandbox summary groups.
 
-    Rows whose sandbox resource is gone are included with
-    ``deleted = true`` (the UI shows a ``已删除`` marker). ``search``
-    matches sandbox ids by substring (case-insensitive, fuzzy) OR node
-    IPs exactly - typing an IP returns every sandbox on that node.
-    ``sort`` is ``request_time``, ``request_count``, ``created_at`` or
-    ``accessed``; prefix with ``-`` for descending (default: newest
-    first; sorting by ``accessed`` ascending puts never-accessed
-    sandboxes first). ``time_from``/``time_to`` bound the latest request
-    time (ISO 8601, inclusive; naive values are assumed to be UTC).
+    Rows are grouped by ``user_id`` when the cluster sync resolved one;
+    sandboxes without a user id report per-sandbox stats. All of a
+    user's sandboxes share one summed ``request_count`` and the latest
+    ``request_time`` (see ``store.list_latest``).
     """
     _require_api_auth(request)
     return _safe_query(
@@ -379,13 +374,20 @@ def list_requests(
     request: Request,
     store: StoreDep,
     sandbox_id: Annotated[str | None, Query(min_length=1)] = None,
+    user_id: Annotated[str | None, Query(min_length=1)] = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> dict:
-    """List access request details, newest first, optionally filtered by sandbox."""
+    """List access request details, newest first, filterable by sandbox id
+    or by user id (all of the user's sandboxes)."""
     _require_api_auth(request)
     return _safe_query(
-        lambda: store.list_details(sandbox_id=sandbox_id, limit=limit, offset=offset)
+        lambda: store.list_details(
+            sandbox_id=sandbox_id,
+            user_id=user_id,
+            limit=limit,
+            offset=offset,
+        )
     )
 
 
@@ -415,7 +417,7 @@ def sync_deleted(request: Request, store: StoreDep) -> dict:
         request.app.state, "k8s_client", None
     ) or k8s.K8sClient(KUBECONFIG_PATH)
     try:
-        result = _sync_sandboxes(store, k8s_client)
+        result = _sync_sandboxes(store, k8s_client, K8S_NAMESPACE)
     except k8s.K8sError as exc:
         logger.error("k8s sandbox sync failed: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from None
@@ -423,11 +425,6 @@ def sync_deleted(request: Request, store: StoreDep) -> dict:
         logger.exception("failed to sync sandboxes")
         raise HTTPException(status_code=502, detail="failed to sync sandboxes") from None
     return {"namespace": K8S_NAMESPACE, **result}
-
-
-def _require_api_auth(request: Request) -> None:
-    if UI_PASSWORD and not _valid_session(_session_token(request)):
-        raise HTTPException(status_code=401, detail="login required")
 
 
 def _safe_query(query) -> dict:

@@ -30,5 +30,16 @@ namespace = ""
 # deleted flags; 0 = manual sync via POST /api/sync-deleted only.
 sync_interval = 0
 
+[events]
+# Audit events whose URI ends with any of these suffixes (case-insensitive)
+# are dropped and not recorded - typically health-check pings, e.g.
+# /<sandbox-id>/<port>/ping.
+#
+# An entry may also carry query parameter names (values are ignored):
+# "/usage?days=" matches /usage?days=1, /usage?days=30, /usage?days=1&x=2 ...
+excluded_uri_suffixes = ["ping"]
+# To exclude more URI suffixes, add them to the array, e.g.:
+# excluded_uri_suffixes = ["ping", "healthz", "/status", "/usage?days="]
+
 [log]
 level = "INFO"

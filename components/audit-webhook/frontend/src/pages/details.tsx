@@ -17,36 +17,29 @@ import { mountPage } from "../app";
 interface RequestRow {
   id: number;
   sandbox_id: string;
+  user_id: string | null;
+  /** true when the sandbox resource no longer exists (history) */
+  sandbox_deleted: boolean;
   uri: string;
-  method: string;
-  target: string;
   request_time: string;
   received_at: string;
 }
 
 const PAGE_SIZE = 50;
 
-const METHOD_COLORS: Record<string, string> = {
-  GET: "green",
-  POST: "blue",
-  PUT: "orange",
-  DELETE: "red",
-  PATCH: "purple",
-  HEAD: "default",
-  OPTIONS: "default",
-};
-
 function DetailsPage() {
-  // Sandbox filter is pre-filled from ?sandbox_id= when navigating from
-  // the summary page.
-  const initialSandbox = new URLSearchParams(window.location.search).get(
-    "sandbox_id"
-  );
+  // Filter is pre-filled from ?sandbox_id= or ?user_id= when navigating
+  // from the summary page (a user link passes user_id, a bare sandbox
+  // without one passes sandbox_id).
+  const query = new URLSearchParams(window.location.search);
+  const initialSandbox = query.get("sandbox_id") ?? "";
+  const initialUser = query.get("user_id") ?? "";
   const [rows, setRows] = useState<RequestRow[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
-  const [sandboxInput, setSandboxInput] = useState(initialSandbox ?? "");
-  const [sandboxId, setSandboxId] = useState(initialSandbox ?? "");
+  const [sandboxInput, setSandboxInput] = useState(initialSandbox);
+  const [sandboxId, setSandboxId] = useState(initialSandbox);
+  const [userId, setUserId] = useState(initialUser);
   const [page, setPage] = useState(1);
   const [autoRefresh, setAutoRefresh] = useState(false);
 
@@ -57,7 +50,8 @@ function DetailsPage() {
         limit: String(PAGE_SIZE),
         offset: String((page - 1) * PAGE_SIZE),
       });
-      if (sandboxId) params.set("sandbox_id", sandboxId);
+      if (initialUser) params.set("user_id", userId);
+      else if (sandboxId) params.set("sandbox_id", sandboxId);
       const data = await apiFetch<{ total: number; items: RequestRow[] }>(
         `/api/requests?${params}`
       );
@@ -68,7 +62,7 @@ function DetailsPage() {
     } finally {
       setLoading(false);
     }
-  }, [page, sandboxId]);
+  }, [page, sandboxId, userId, initialUser]);
 
   useEffect(() => {
     load();
@@ -90,7 +84,19 @@ function DetailsPage() {
       title: "沙箱 ID",
       dataIndex: "sandbox_id",
       key: "sandbox_id",
-      render: (id: string) => <Typography.Text copyable={{ text: id }}>{id}</Typography.Text>,
+      render: (id: string, row: RequestRow) => (
+        <Space size={4}>
+          <Typography.Text copyable={{ text: id }}>{id}</Typography.Text>
+          {row.sandbox_deleted && <Tag color="default">已删除</Tag>}
+        </Space>
+      ),
+    },
+    {
+      title: "用户 ID",
+      dataIndex: "user_id",
+      key: "user_id",
+      width: 180,
+      render: (id: string | null) => id ?? "-",
     },
     {
       title: "URI",
@@ -102,18 +108,6 @@ function DetailsPage() {
         </Tooltip>
       ),
     },
-    {
-      title: "方法",
-      dataIndex: "method",
-      key: "method",
-      width: 90,
-      render: (method: string) => (
-        <Tag color={METHOD_COLORS[method.toUpperCase()] ?? "default"}>
-          {method}
-        </Tag>
-      ),
-    },
-    { title: "目标", dataIndex: "target", key: "target" },
     {
       title: "请求时间",
       dataIndex: "request_time",
@@ -133,7 +127,10 @@ function DetailsPage() {
   return (
     <>
       <header className="app-header">
-        <h1>OpenSandbox 请求详情</h1>
+        <h1>
+          OpenSandbox 请求详情
+          {initialUser ? `（用户 ${initialUser}）` : ""}
+        </h1>
         <Space>
           <label>
             自动刷新（10s）{" "}
@@ -161,6 +158,7 @@ function DetailsPage() {
               onClick={() => {
                 setSandboxInput("");
                 setSandboxId("");
+                setUserId("");
                 setPage(1);
               }}
             >

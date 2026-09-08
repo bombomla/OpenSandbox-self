@@ -28,7 +28,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py store.py config.py k8s.py ./
+COPY main.py store.py ./
+COPY utils/ ./utils/
 COPY --from=frontend-build /static ./static
 
 # Configuration: mount audit.toml at /app/audit.toml (or set AUDIT_CONFIG_PATH).
