@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
   DatePicker,
@@ -15,7 +15,7 @@ import type { ColumnsType, TablePaginationConfig } from "antd/es/table";
 import type { FilterValue, SorterResult } from "antd/es/table/interface";
 import type { Dayjs } from "dayjs";
 import { apiFetch, errMessage, fmtTime, logout } from "../api";
-import { mountPage } from "../app";
+import { mountPage, useWhitelist } from "../app";
 
 interface SandboxRow {
   /** group key: the user id when known, otherwise the bare sandbox id */
@@ -62,6 +62,10 @@ function SummaryPage() {
   const [sort, setSort] = useState<string>(DEFAULT_SORT);
   const [page, setPage] = useState(1);
   const [autoRefresh, setAutoRefresh] = useState(false);
+  // Column-header filter on 用户类型: "vip" / "normal" / null (all).
+  const [userType, setUserType] = useState<"vip" | "normal" | null>(null);
+  // Whitelisted user ids - shown as VIP用户, everyone else as 普通用户.
+  const whitelist = useWhitelist();
 
   // Guards against out-of-order responses: only the latest load()'s result
   // is applied (rapid sort/search clicks fire overlapping requests).
@@ -77,6 +81,7 @@ function SummaryPage() {
         sort,
       });
       if (search) params.set("search", search);
+      if (userType) params.set("user_type", userType);
       // Date pickers cover whole days in the browser's local timezone.
       if (range?.[0]) params.set("time_from", range[0].startOf("day").toISOString());
       if (range?.[1]) params.set("time_to", range[1].endOf("day").toISOString());
@@ -93,11 +98,17 @@ function SummaryPage() {
     } finally {
       if (seq === loadSeq.current) setLoading(false);
     }
-  }, [page, sort, search, range]);
+  }, [page, sort, search, range, userType]);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  // The whitelist rarely changes (it is config-driven) - fetched once
+  // per page view by useWhitelist; keep a Set for the type column.
+
+  // Whitelisted groups keep the marker when the filter card is collapsed.
+  const whitelistSet = useMemo(() => new Set(whitelist), [whitelist]);
 
   useEffect(() => {
     if (!autoRefresh) return;
@@ -115,6 +126,7 @@ function SummaryPage() {
     setSearch("");
     setRange(null);
     setSort(DEFAULT_SORT);
+    setUserType(null);
     setPage(1);
   };
 
@@ -122,21 +134,32 @@ function SummaryPage() {
   // the sorter always carries a direction. An empty order (antd sends an
   // empty sorter object on a cancel) can only arrive as an edge case -
   // fall back to the default sort there rather than leaving the
-  // controlled sortOrder stuck on the last direction.
+  // controlled sortOrder stuck on the last direction. The sort key comes
+  // from columnKey (the 用户类型 column's key differs from its dataIndex).
   const onTableChange = (
     pagination: TablePaginationConfig,
-    _filters: Record<string, FilterValue | null>,
+    filters: Record<string, FilterValue | null>,
     sorter: SorterResult<SandboxRow> | SorterResult<SandboxRow>[]
   ) => {
     const s = Array.isArray(sorter) ? sorter[0] : sorter;
     if (pagination.current) setPage(pagination.current);
     const nextSort = s?.order
       ? s.order === "ascend"
-        ? String(s.field)
-        : `-${s.field}`
+        ? String(s.columnKey)
+        : `-${String(s.columnKey)}`
       : DEFAULT_SORT;
     if (nextSort !== sort) {
       setSort(nextSort);
+      setPage(1);
+    }
+    // 用户类型 column filter (single-choice); an empty selection = all.
+    const typeFilter = filters["user_type"];
+    const nextType =
+      Array.isArray(typeFilter) && typeFilter.length === 1
+        ? (String(typeFilter[0]) as "vip" | "normal")
+        : null;
+    if (nextType !== userType) {
+      setUserType(nextType);
       setPage(1);
     }
   };
@@ -147,6 +170,27 @@ function SummaryPage() {
       dataIndex: "uid",
       key: "uid",
       render: (id: string) => id,
+    },
+    {
+      title: "用户类型",
+      key: "user_type",
+      width: 130,
+      filters: [
+        { text: "VIP用户", value: "vip" },
+        { text: "普通用户", value: "normal" },
+      ],
+      filterMultiple: false,
+      filteredValue: userType ? [userType] : null,
+      sorter: true,
+      sortDirections: [...SORT_DIRECTIONS],
+      sortOrder:
+        sort === "user_type" ? "ascend" : sort === "-user_type" ? "descend" : null,
+      render: (_: unknown, row: SandboxRow) =>
+        whitelistSet.has(row.uid) ? (
+          <Tag color="gold">VIP用户</Tag>
+        ) : (
+          <Tag>普通用户</Tag>
+        ),
     },
     {
       title: "当前沙箱 ID",
@@ -246,6 +290,30 @@ function SummaryPage() {
         </Space>
       </header>
       <main className="app-main">
+        {whitelist.length > 0 && (
+          <div className="table-card whitelist-card">
+            <span className="whitelist-title">VIP 用户</span>
+            <Space wrap size={[8, 8]}>
+              {whitelist.map((user) => (
+                <Tag.CheckableTag
+                  key={user}
+                  checked={search === user}
+                  onChange={(checked) => {
+                    // The card jumps to one VIP user - a "normal only"
+                    // column filter would hide it, so clear that filter.
+                    if (checked) setUserType(null);
+                    applySearch(checked ? user : "");
+                  }}
+                >
+                  {user}
+                </Tag.CheckableTag>
+              ))}
+            </Space>
+            <Typography.Text type="secondary" className="whitelist-count">
+              共 {whitelist.length} 位
+            </Typography.Text>
+          </div>
+        )}
         <div className="table-card">
           <div className="table-toolbar">
             <Input.Search
@@ -273,7 +341,7 @@ function SummaryPage() {
             累计请求数为该组所有沙箱之和，最新请求时间取最近一次。点击「访问详情」查看该用户（含历史沙箱）的请求记录；
             点击「状态」/「创建时间」/「最新请求时间」/「累计请求数」表头排序（降序 ↔ 升序循环）；
             「未访问」表示沙箱存在于集群但尚无访问记录；已从集群移除的沙箱不再显示（其访问记录在详情页仍可查询）；
-            搜索框输入节点 IP 可查到该节点上沙箱所属的分组
+            搜索框输入节点 IP 可查到该节点上沙箱所属的分组；白名单（VIP）用户在「用户类型」列以金色标识，点击该列表头可按用户类型筛选与排序，上方卡片可点击按该用户过滤
           </p>
           <Table<SandboxRow>
             rowKey="uid"

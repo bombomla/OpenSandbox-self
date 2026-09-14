@@ -45,6 +45,7 @@ _DEFAULTS = {
     "k8s_sync_interval": 0,
     "log_level": "INFO",
     "excluded_uri_suffixes": ["ping"],
+    "whitelist_users": [],
 }
 
 _INT_KEYS = ("port", "db_pool_min", "db_pool_max", "k8s_sync_interval")
@@ -63,6 +64,7 @@ _SECTION_KEYS = {
         "sync_interval": "k8s_sync_interval",
     },
     "events": {"excluded_uri_suffixes": "excluded_uri_suffixes"},
+    "whitelist": {"users": "whitelist_users"},
     "log": {"level": "log_level"},
 }
 
@@ -130,5 +132,20 @@ def load_config(path: str | Path | None = None) -> dict:
             "of strings"
         )
     config["excluded_uri_suffixes"] = [suffix for suffix in suffixes if suffix]
+
+    users = config["whitelist_users"]
+    if isinstance(users, str):
+        # Accept a single string or an array of strings (user ids to
+        # highlight on the summary page).
+        users = [users]
+    if (
+        not isinstance(users, list)
+        or not all(isinstance(user, str) for user in users)
+    ):
+        raise ValueError(
+            "config key 'whitelist.users' must be a string or an array "
+            "of strings"
+        )
+    config["whitelist_users"] = [user.strip() for user in users if user.strip()]
 
     return config

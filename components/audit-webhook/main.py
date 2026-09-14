@@ -36,7 +36,7 @@ import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Union
+from typing import Annotated, Literal, Union
 
 # The config/k8s helpers live in ./utils - add it to sys.path so the module
 # works when run directly (python main.py) and under pytest.
@@ -92,6 +92,12 @@ UI_PASSWORD = _config["ui_password"]
 KUBECONFIG_PATH = _config["kubeconfig"]
 K8S_NAMESPACE = _config["k8s_namespace"]
 K8S_SYNC_INTERVAL = _config["k8s_sync_interval"]
+
+# Whitelisted user ids (``[whitelist] users`` in audit.toml): shown on
+# the summary page and excluded from GET /api/sandboxes/times. It does
+# not change access control or what gets recorded - every sandbox is
+# audited alike.
+WHITELIST_USERS = _config["whitelist_users"]
 
 _SESSION_TTL = 7 * 24 * 3600  # 7 days, in seconds
 
@@ -196,6 +202,27 @@ def _login_redirect() -> RedirectResponse:
 def _require_api_auth(request: Request) -> None:
     if UI_PASSWORD and not _valid_session(_session_token(request)):
         raise HTTPException(status_code=401, detail="login required")
+
+
+def _require_api_auth_or_token(request: Request) -> None:
+    """Like ``_require_api_auth`` but also accepts an
+    ``Authorization: Bearer <password>`` header, so programmatic
+    callers can pass the UI password directly instead of logging in
+    for a session cookie first."""
+    if UI_PASSWORD == "":
+        return  # auth disabled
+    if _valid_session(_session_token(request)):
+        return
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() == "bearer" and secrets.compare_digest(
+        token.encode(), UI_PASSWORD.encode()
+    ):
+        return
+    raise HTTPException(
+        status_code=401,
+        detail="login required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 @app.get("/login", response_class=HTMLResponse, include_in_schema=False)
@@ -342,12 +369,16 @@ def list_sandboxes(
     store: StoreDep,
     search: Annotated[str | None, Query(min_length=1)] = None,
     sort: Annotated[
-        str, Query(pattern=r"^-?(request_time|request_count|accessed|created_at)$")
+        str,
+        Query(
+            pattern=r"^-?(request_time|request_count|accessed|created_at|user_type)$"
+        ),
     ] = "-request_time",
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
     time_from: Annotated[datetime | None, Query()] = None,
     time_to: Annotated[datetime | None, Query()] = None,
+    user_type: Annotated[Literal["vip", "normal"] | None, Query()] = None,
 ) -> dict:
     """List per-user/per-sandbox summary groups.
 
@@ -355,6 +386,11 @@ def list_sandboxes(
     sandboxes without a user id report per-sandbox stats. All of a
     user's sandboxes share one summed ``request_count`` and the latest
     ``request_time`` (see ``store.list_latest``).
+
+    ``user_type=vip`` keeps whitelisted users (``[whitelist] users``),
+    ``user_type=normal`` the rest; ``sort=user_type`` /
+    ``-user_type`` orders by the same membership (ascending = normal
+    users first, descending = VIP first).
     """
     _require_api_auth(request)
     return _safe_query(
@@ -365,6 +401,42 @@ def list_sandboxes(
             offset=offset,
             time_from=time_from,
             time_to=time_to,
+            whitelist_users=WHITELIST_USERS,
+            user_type=user_type,
+        )
+    )
+
+
+@app.get("/api/sandboxes/times")
+def list_sandbox_times(
+    request: Request,
+    store: StoreDep,
+    limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict:
+    """List one row per sandbox id: ``user_id``, ``sandbox_id``,
+    ``created_at`` and ``request_time`` (the latest request time),
+    newest first.
+
+    Sandboxes that were never accessed have no latest request time -
+    their ``request_time`` falls back to the creation time, so no row
+    carries an empty ``request_time``. Deleted sandboxes are included
+    (their audit history stays complete).
+
+    Whitelisted users (``[whitelist] users`` in audit.toml) are
+    excluded - their sandboxes stay out of this usage/lifetime report
+    (sandboxes without a user id are still listed).
+
+    Authentication: a session cookie (login) or an
+    ``Authorization: Bearer <password>`` header carrying the UI
+    password (``server.ui_password``).
+    """
+    _require_api_auth_or_token(request)
+    return _safe_query(
+        lambda: store.list_sandbox_times(
+            limit=limit,
+            offset=offset,
+            exclude_users=WHITELIST_USERS,
         )
     )
 
@@ -389,6 +461,18 @@ def list_requests(
             offset=offset,
         )
     )
+
+
+@app.get("/api/whitelist")
+def get_whitelist(request: Request) -> dict:
+    """List the whitelisted user ids (``[whitelist] users`` in audit.toml).
+
+    The whitelist is informational only - it marks notable users on the
+    summary page and does not change what is recorded or who may access
+    the UI.
+    """
+    _require_api_auth(request)
+    return {"users": list(WHITELIST_USERS)}
 
 
 @app.post("/api/sync-deleted")

@@ -12,7 +12,7 @@ import {
 } from "antd";
 import type { ColumnsType, TablePaginationConfig } from "antd/es/table";
 import { apiFetch, errMessage, fmtTime } from "../api";
-import { mountPage } from "../app";
+import { mountPage, useWhitelist } from "../app";
 
 interface RequestRow {
   id: number;
@@ -42,6 +42,8 @@ function DetailsPage() {
   const [userId, setUserId] = useState(initialUser);
   const [page, setPage] = useState(1);
   const [autoRefresh, setAutoRefresh] = useState(false);
+  // Whitelisted users display as VIP用户, others as 普通用户.
+  const whitelist = useWhitelist();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -95,8 +97,20 @@ function DetailsPage() {
       title: "用户 ID",
       dataIndex: "user_id",
       key: "user_id",
-      width: 180,
-      render: (id: string | null) => id ?? "-",
+      width: 200,
+      render: (id: string | null) =>
+        id ? (
+          <Space size={4} wrap={false}>
+            <span>{id}</span>
+            {whitelist.includes(id) ? (
+              <Tag color="gold">VIP用户</Tag>
+            ) : (
+              <Tag>普通用户</Tag>
+            )}
+          </Space>
+        ) : (
+          "-"
+        ),
     },
     {
       title: "URI",

@@ -123,9 +123,12 @@ class FakeStore:
         offset=0,
         time_from=None,
         time_to=None,
+        whitelist_users=None,
+        user_type=None,
     ):
         if self.fail:
             raise RuntimeError("db down")
+        whitelist = set(whitelist_users or [])
 
         def matches_search(sandbox_id):
             if search is None:
@@ -213,6 +216,11 @@ class FakeStore:
                 group["request_time"] = m["request_time"]
             group["request_count"] += counts.get(m["sandbox_id"], 0)
         items = list(groups.values())
+        # Whitelist (VIP) type filter, mirroring the SQL on the group key.
+        if user_type == "vip":
+            items = [item for item in items if item["uid"] in whitelist]
+        elif user_type == "normal":
+            items = [item for item in items if item["uid"] not in whitelist]
         return {
             "total": len(items),
             "items": items[offset : offset + limit],
@@ -251,6 +259,38 @@ class FakeStore:
         ]
         return {"total": len(matches), "items": items}
 
+    def list_sandbox_times(self, limit=50, offset=0, exclude_users=None):
+        if self.fail:
+            raise RuntimeError("db down")
+        excluded = set(exclude_users or [])
+        # Latest request time per sandbox (None = never accessed).
+        latest = {}
+        for event in self.events:
+            sandbox_id = event["sandbox_id"]
+            if sandbox_id not in latest or event["request_time"] > latest[sandbox_id]:
+                latest[sandbox_id] = event["request_time"]
+        items = [
+            {
+                "sandbox_id": sandbox_id,
+                "user_id": self.user_ids.get(sandbox_id),
+                "created_at": self.created_at.get(sandbox_id),
+                # COALESCE(request_time, created_at): never-accessed rows
+                # report the creation time as their latest request time.
+                "request_time": latest.get(sandbox_id, self.created_at.get(sandbox_id)),
+            }
+            for sandbox_id in self.created_at
+            # Whitelisted users are excluded; rows without a user id stay.
+            if self.user_ids.get(sandbox_id) not in excluded
+        ]
+
+        def sort_key(item):
+            time = item["request_time"]
+            # DESC NULLS LAST: rows without any time go to the end.
+            return (time is None, time)
+
+        items.sort(key=sort_key, reverse=True)
+        return {"total": len(items), "items": items[offset : offset + limit]}
+
     def sync_deleted_flags(self, live_ids):
         if self.fail:
             raise RuntimeError("db down")
@@ -267,10 +307,12 @@ class FakeStore:
 @pytest.fixture()
 def client(monkeypatch):
     fake = FakeStore()
-    # Force auth off regardless of the local audit.toml so tests are
-    # independent of the developer's configuration (auth-specific tests
-    # override this via monkeypatch themselves).
+    # Force auth off and the whitelist empty regardless of the local
+    # audit.toml so tests are independent of the developer's
+    # configuration (auth/whitelist-specific tests override these via
+    # monkeypatch themselves).
     monkeypatch.setattr(main, "UI_PASSWORD", "")
+    monkeypatch.setattr(main, "WHITELIST_USERS", [])
     # Bypass the lifespan (which opens a real PostgreSQL pool) by injecting
     # the fake store directly into app state.
     main.app.state.store = fake
@@ -415,6 +457,37 @@ def test_healthz(client):
     assert response.json() == {"status": "ok"}
 
 
+def test_sandbox_times_bearer_auth(monkeypatch, client):
+    """/api/sandboxes/times accepts an Authorization: Bearer <password>
+    header in addition to the session cookie."""
+    monkeypatch.setattr(main, "UI_PASSWORD", "secret")
+    test_client, fake = client
+    fake.record([EVENT])
+
+    # No credentials -> 401.
+    response = test_client.get("/api/sandboxes/times")
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+
+    # Wrong password -> 401.
+    response = test_client.get(
+        "/api/sandboxes/times", headers={"Authorization": "Bearer wrong"}
+    )
+    assert response.status_code == 401
+
+    # Correct password in the header -> 200.
+    response = test_client.get(
+        "/api/sandboxes/times", headers={"Authorization": "Bearer secret"}
+    )
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+
+    # A valid session cookie still works.
+    test_client.post("/login", json={"password": "secret"})
+    response = test_client.get("/api/sandboxes/times")
+    assert response.status_code == 200
+
+
 def test_index_page(client):
     test_client, _ = client
 
@@ -462,6 +535,7 @@ def test_auth_flow(monkeypatch, client):
     # APIs reject with 401.
     assert test_client.get("/api/sandboxes").status_code == 401
     assert test_client.get("/api/requests").status_code == 401
+    assert test_client.get("/api/whitelist").status_code == 401
 
     # Event ingestion is never password protected.
     assert test_client.post("/events", json=EVENT).status_code == 200
@@ -489,6 +563,28 @@ def test_auth_disabled_by_default(client):
     assert test_client.get("/", follow_redirects=False).status_code == 200
     assert test_client.get("/api/sandboxes").status_code == 200
     assert test_client.post("/login", json={"password": "anything"}).status_code == 200
+
+
+def test_get_whitelist(monkeypatch, client):
+    """/api/whitelist returns the configured whitelisted user ids."""
+    monkeypatch.setattr(main, "WHITELIST_USERS", ["u-1", "u-2"])
+    test_client, _ = client
+
+    response = test_client.get("/api/whitelist")
+
+    assert response.status_code == 200
+    assert response.json() == {"users": ["u-1", "u-2"]}
+
+
+def test_get_whitelist_empty(monkeypatch, client):
+    """An empty whitelist renders as an empty users list."""
+    monkeypatch.setattr(main, "WHITELIST_USERS", [])
+    test_client, _ = client
+
+    response = test_client.get("/api/whitelist")
+
+    assert response.status_code == 200
+    assert response.json() == {"users": []}
 
 
 def test_list_sandboxes(client):
@@ -606,6 +702,145 @@ def test_list_sandboxes_groups_by_user(client):
     response = test_client.get("/api/sandboxes", params={"search": "sb-b"})
     assert response.json()["total"] == 1
     assert response.json()["items"][0]["uid"] == "u-1"
+
+
+def test_list_sandboxes_user_type_filter(monkeypatch, client):
+    """user_type=vip keeps whitelisted groups; normal keeps the rest."""
+    monkeypatch.setattr(main, "WHITELIST_USERS", ["u-1"])
+    test_client, fake = client
+    fake.user_ids = {"sb-a": "u-1", "sb-b": "u-2"}
+    fake.record([EVENT | {"sandbox_id": "sb-a"},
+                 EVENT | {"sandbox_id": "sb-b"}])
+
+    # vip -> only u-1's group.
+    response = test_client.get("/api/sandboxes", params={"user_type": "vip"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 1
+    assert data["items"][0]["uid"] == "u-1"
+
+    # normal -> only u-2's group.
+    response = test_client.get("/api/sandboxes", params={"user_type": "normal"})
+    assert data["total"] == 1 or response.json()["total"] == 1
+    assert response.json()["total"] == 1
+    assert response.json()["items"][0]["uid"] == "u-2"
+
+    # no filter -> both groups.
+    response = test_client.get("/api/sandboxes")
+    assert response.json()["total"] == 2
+
+
+def test_list_sandboxes_user_type_filter_empty_whitelist(monkeypatch, client):
+    """An empty whitelist makes every group normal; vip returns none."""
+    monkeypatch.setattr(main, "WHITELIST_USERS", [])
+    test_client, fake = client
+    fake.record([EVENT, {**EVENT, "sandbox_id": "other"}])
+
+    assert test_client.get(
+        "/api/sandboxes", params={"user_type": "vip"}
+    ).json()["total"] == 0
+    assert test_client.get(
+        "/api/sandboxes", params={"user_type": "normal"}
+    ).json()["total"] == 2
+
+
+def test_list_sandboxes_sort_user_type(monkeypatch, client):
+    """sort=±user_type is accepted; descending puts VIP users first."""
+    monkeypatch.setattr(main, "WHITELIST_USERS", ["u-vip"])
+    test_client, fake = client
+    fake.user_ids = {"sb-vip": "u-vip", "sb-norm": "u-norm"}
+    fake.record([EVENT | {"sandbox_id": "sb-vip"},
+                 EVENT | {"sandbox_id": "sb-norm"}])
+
+    for key in ("user_type", "-user_type"):
+        response = test_client.get("/api/sandboxes", params={"sort": key})
+        assert response.status_code == 200
+        assert response.json()["sort"] == key
+
+
+def test_list_sandboxes_invalid_user_type_rejected(client):
+    test_client, _ = client
+
+    assert test_client.get(
+        "/api/sandboxes", params={"user_type": "premium"}
+    ).status_code == 422
+
+
+def test_list_sandbox_times(client):
+    """One row per sandbox; a never-accessed sandbox reports its creation
+    time as the latest request time."""
+    test_client, fake = client
+    fake.user_ids = {"sb-a": "u-1"}
+    fake.record([
+        EVENT | {"sandbox_id": "sb-a"},
+        {**EVENT, "sandbox_id": "sb-b", "request_time": "2026-08-21T09:24:12.252+08:00"},
+    ])
+    # Discovered in the cluster but never accessed: no request_time, so
+    # the row falls back to the creation timestamp.
+    fake.upsert_discovered_sandboxes([{
+        "name": "sb-c",
+        "created_at": datetime(2026, 8, 19, tzinfo=timezone.utc),
+        "user_id": "u-2",
+    }])
+
+    response = test_client.get("/api/sandboxes/times")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 3
+    by_sandbox = {item["sandbox_id"]: item for item in data["items"]}
+    # Newest first; the never-accessed sandbox falls back to created_at.
+    assert [item["sandbox_id"] for item in data["items"]] == ["sb-b", "sb-a", "sb-c"]
+    assert by_sandbox["sb-a"]["user_id"] == "u-1"
+    assert by_sandbox["sb-a"]["request_time"] == "2026-08-20T09:24:12+08:00"
+    assert by_sandbox["sb-c"]["user_id"] == "u-2"
+    assert by_sandbox["sb-c"]["request_time"] == by_sandbox["sb-c"]["created_at"]
+    assert by_sandbox["sb-c"]["created_at"] == "2026-08-19T00:00:00Z"
+
+
+def test_list_sandbox_times_includes_deleted_and_paginates(client):
+    """Deleted sandboxes stay in the listing (audit history), and
+    limit/offset paginate it."""
+    test_client, fake = client
+    fake.record([
+        {**EVENT, "sandbox_id": f"sb-{index:02d}",
+         "request_time": f"2026-08-2{index}T09:24:12.252+08:00"}
+        for index in range(3)
+    ])
+    fake.sync_deleted_flags(["sb-00"])  # sb-01 and sb-02 are removed
+
+    response = test_client.get("/api/sandboxes/times", params={"limit": 1})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 3
+    assert [item["sandbox_id"] for item in data["items"]] == ["sb-02"]
+
+    response = test_client.get(
+        "/api/sandboxes/times", params={"limit": 2, "offset": 1}
+    )
+    assert [item["sandbox_id"] for item in response.json()["items"]] == ["sb-01", "sb-00"]
+
+
+def test_list_sandbox_times_excludes_whitelisted_users(monkeypatch, client):
+    """Whitelisted users' sandboxes stay out of /api/sandboxes/times;
+    sandboxes without a user id are still listed."""
+    monkeypatch.setattr(main, "WHITELIST_USERS", ["u-1"])
+    test_client, fake = client
+    fake.user_ids = {"sb-a": "u-1", "sb-b": "u-2"}
+    fake.record([
+        EVENT | {"sandbox_id": "sb-a"},
+        {**EVENT, "sandbox_id": "sb-b", "request_time": "2026-08-21T09:24:12.252+08:00"},
+        {**EVENT, "sandbox_id": "sb-c"},  # no user id - stays listed
+    ])
+
+    response = test_client.get("/api/sandboxes/times")
+
+    assert response.status_code == 200
+    data = response.json()
+    # sb-a (whitelisted user) is gone; sb-b and the bare sb-c remain.
+    assert data["total"] == 2
+    assert {item["sandbox_id"] for item in data["items"]} == {"sb-b", "sb-c"}
 
 
 def test_list_requests_filter_by_user(client):

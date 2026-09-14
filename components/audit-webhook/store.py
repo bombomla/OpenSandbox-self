@@ -195,7 +195,10 @@ SELECT count(*) AS total FROM (SELECT uid FROM member GROUP BY uid) AS groups
 
 # Whitelisted sort orders for the grouped summary listing. Never-accessed
 # rows have a NULL request_time and always sort last within an accessed
-# group; groups without a creation timestamp always sort last.
+# group; groups without a creation timestamp always sort last. The
+# user_type orders rank whitelist (VIP) groups via the bound ``whitelist``
+# array: descending puts VIP users first, ascending normal users first;
+# ties fall back to the latest request time.
 _LATEST_ORDERS = {
     "request_time": "request_time ASC",
     "-request_time": "request_time DESC NULLS LAST",
@@ -205,7 +208,33 @@ _LATEST_ORDERS = {
     "-accessed": "accessed DESC, request_time DESC NULLS LAST",
     "created_at": "created_at ASC NULLS LAST",
     "-created_at": "created_at DESC NULLS LAST",
+    "user_type": "(uid = ANY(%(whitelist)s)) ASC, request_time DESC NULLS LAST",
+    "-user_type": "(uid = ANY(%(whitelist)s)) DESC, request_time DESC NULLS LAST",
 }
+
+# Flat per-sandbox listing for usage/lifetime reports: one row per
+# sandbox id with its user id, creation time and latest request time.
+# Sandboxes never accessed (request_time NULL) report their creation
+# time as the latest request time via COALESCE, so every row carries a
+# usable "last seen" timestamp. All rows are returned, deleted ones
+# included (audit history stays complete even after an ephemeral
+# sandbox is removed from the cluster). ``{where}`` optionally drops
+# whitelisted users (their rows are excluded from the report).
+_LIST_SANDBOX_TIMES = """
+SELECT sandbox_id,
+       user_id,
+       created_at,
+       COALESCE(request_time, created_at) AS request_time,
+       count(*) OVER () AS __total
+FROM sandbox_access_latest
+{where}
+ORDER BY request_time DESC NULLS LAST
+LIMIT %(limit)s OFFSET %(offset)s
+"""
+
+_COUNT_SANDBOX_TIMES = """
+SELECT count(*) AS total FROM sandbox_access_latest {where}
+"""
 
 _LIST_DETAILS = """
 SELECT log.id, log.sandbox_id, log.uri, log.method, log.target, log.request_time, log.received_at,
@@ -265,6 +294,8 @@ class AuditStore:
         offset: int = 0,
         time_from: datetime | None = None,
         time_to: datetime | None = None,
+        whitelist_users: list[str] | None = None,
+        user_type: str | None = None,
     ) -> dict:
         """List per-user summary groups, sorted by ``sort``.
 
@@ -285,13 +316,22 @@ class AuditStore:
         (``-`` prefix means descending); default is newest first. The
         group's ``node_ip`` is its current sandbox's node (a NULL when
         the pod is not scheduled yet).
+
+        ``whitelist_users`` marks the VIP users (``[whitelist] users``):
+        ``user_type = "vip"`` keeps only groups whose key is in it,
+        ``"normal"`` keeps the rest (with an empty whitelist, every
+        group is normal); it also drives the ``user_type`` sort keys.
         """
         try:
             order = _LATEST_ORDERS[sort]
         except KeyError:
             raise ValueError(f"invalid sort key: {sort}") from None
 
-        params: dict = {"limit": limit, "offset": offset}
+        params: dict = {
+            "limit": limit,
+            "offset": offset,
+            "whitelist": whitelist_users or [],
+        }
         conditions = []
         if search:
             # Fuzzy match on the group key (user id or bare sandbox id) OR
@@ -304,6 +344,12 @@ class AuditStore:
                 " OR sandbox_id ILIKE %(pattern)s ESCAPE '\\'"
                 " OR node_ip = %(node_ip)s)"
             )
+        if user_type == "vip":
+            conditions.append("COALESCE(user_id, sandbox_id) = ANY(%(whitelist)s)")
+        elif user_type == "normal":
+            # COALESCE never yields NULL (sandbox_id is the primary key),
+            # so the NULL-trap of ``<> ALL`` does not apply here.
+            conditions.append("COALESCE(user_id, sandbox_id) <> ALL(%(whitelist)s)")
         if time_from is not None:
             params["time_from"] = _ensure_utc(time_from)
             conditions.append("request_time >= %(time_from)s")
@@ -324,6 +370,54 @@ class AuditStore:
                     # Past the last page: the window count returned nothing,
                     # fall back to a separate COUNT for the true total.
                     cur.execute(_COUNT_LATEST.format(extra=extra), params)
+                    total = cur.fetchone()["total"]
+        return {"total": total, "items": [_jsonify(row) for row in rows]}
+
+    def list_sandbox_times(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        exclude_users: list[str] | None = None,
+    ) -> dict:
+        """List one row per sandbox id: user id, creation time and latest
+        request time, newest first.
+
+        The latest request time falls back to the creation time for
+        sandboxes that were never accessed (their ``request_time`` is
+        NULL), so no row has an empty ``request_time``. Deleted rows are
+        included - the audit history of removed ephemeral sandboxes
+        stays complete. ``exclude_users`` drops every row of the listed
+        user ids (the whitelist: their sandboxes stay out of the
+        usage/lifetime report); rows without a user id are kept.
+        """
+        # Skipping the filter entirely lets the planner use a plain scan.
+        # The explicit IS NULL keeps rows without a user id: ``NULL <> ALL
+        # (array)`` evaluates to NULL and would drop them otherwise.
+        where = ""
+        if exclude_users:
+            where = (
+                "WHERE user_id IS NULL OR user_id <> ALL(%(exclude_users)s)"
+            )
+            params = {"exclude_users": exclude_users}
+        else:
+            params = {}
+        params.update({"limit": limit, "offset": offset})
+
+        with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            with conn.cursor() as cur:
+                cur.execute(
+                    _LIST_SANDBOX_TIMES.format(where=where),
+                    params,
+                )
+                rows = cur.fetchall()
+                if rows:
+                    total = rows[0]["__total"]
+                    rows = [_drop_total(row) for row in rows]
+                else:
+                    # Past the last page: the window count returned nothing,
+                    # fall back to a separate COUNT for the true total.
+                    cur.execute(_COUNT_SANDBOX_TIMES.format(where=where), params)
                     total = cur.fetchone()["total"]
         return {"total": total, "items": [_jsonify(row) for row in rows]}
 

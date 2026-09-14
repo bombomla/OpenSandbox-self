@@ -41,5 +41,14 @@ excluded_uri_suffixes = ["ping"]
 # To exclude more URI suffixes, add them to the array, e.g.:
 # excluded_uri_suffixes = ["ping", "healthz", "/status", "/usage?days="]
 
+[whitelist]
+# User ids to highlight on the summary page (白名单用户) and to exclude
+# from GET /api/sandboxes/times (their sandboxes stay out of the
+# usage/lifetime report). Whitelisting does not change access control or
+# what gets recorded - every sandbox is audited alike. An empty list
+# hides the whitelist card and excludes nothing from the report.
+users = []
+# users = ["7680071018521559040"]
+
 [log]
 level = "INFO"

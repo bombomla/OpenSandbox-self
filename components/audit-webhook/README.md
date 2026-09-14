@@ -25,11 +25,15 @@ protected when `server.ui_password` is set):
   sandbox at a time, so each row pairs the user with their *current*
   sandbox (fallback: sandboxes without a user id are their own row);
   search on user id / sandbox id / node IP, a date-range filter on the
-  latest request time, sortable columns, and auto-refresh; clicking
-  访问详情 opens the detail page covering the user's whole sandbox
-  history (current and removed sandboxes).
+  latest request time, sortable columns, and auto-refresh; whitelisted
+  users display as `VIP用户` (gold) in the 用户类型 column, everyone
+  else as `普通用户`, and a clickable **VIP 用户** card above the table
+  filters by a whitelisted user; clicking 访问详情 opens the detail
+  page covering the user's whole sandbox history (current and removed
+  sandboxes).
 - `GET /details?sandbox_id=<id>` - **请求详情页**: request details with
-  sandbox filter, pagination, and optional auto-refresh.
+  sandbox filter, pagination, optional auto-refresh, and a `VIP用户` /
+  `普通用户` marker next to each row's user id.
 - `GET /login` - password login page (session cookie, 7-day validity).
 
 ## Quick Start
@@ -49,7 +53,10 @@ Endpoints: `POST /events` (audit events; `POST /` is an alias, so a
 path-less webhook URL also works), `GET /` (summary page), `GET /details`
 (detail page), `GET /login` / `POST /login` / `POST /logout` (UI auth),
 `GET /api/sandboxes` and `GET /api/requests` (JSON queries),
-`POST /api/sync-deleted` (mark deleted sandboxes), `GET /status.ok`
+`GET /api/sandboxes/times` (per-sandbox creation and latest request
+times), `GET /api/whitelist` (configured whitelist users),
+`POST /api/sync-deleted` (mark deleted sandboxes),
+`GET /status.ok`
 (health).
 
 Event ingestion (`POST /events`) is never password protected - the ingress
@@ -80,6 +87,7 @@ is optional - defaults are shown below.
 | `kubernetes.kubeconfig` | (empty) | Kubeconfig file path for the deleted-sync (empty = default kubeconfig, falling back to in-cluster credentials) |
 | `kubernetes.namespace` | (empty) | Namespace whose `batchsandboxes.sandbox.opensandbox.io` resources mark live sandbox ids (the resource name is the sandbox id; required by the sync) |
 | `kubernetes.sync_interval` | `0` | When > 0 (seconds), sync against the cluster periodically in the background (discover unaccessed sandboxes + reconcile the `deleted` flags); `0` = manual sync via `POST /api/sync-deleted` only |
+| `whitelist.users` | `[]` | User ids displayed as `VIP用户` on the summary page (用户类型 column + clickable **VIP 用户** card) and on the details page (marker next to the user id), everyone else as `普通用户`; their sandboxes are also excluded from `GET /api/sandboxes/times`. It does not change access control or audit recording (`/api/sandboxes`, `/api/requests` and ingestion are unaffected) |
 | `log.level` | `INFO` | Log level |
 
 ## API
@@ -115,13 +123,17 @@ the latest request time (two date pickers - start/end, both inclusive,
 interpreted in the browser's local timezone). Clicking a row's
 访问详情 navigates to `GET /details?user_id=<id>` (or
 `?sandbox_id=<id>` for bare sandboxes) showing the request history of
-every sandbox the user ever ran, current and removed alike.
+every sandbox the user ever ran, current and removed alike. A 用户类型
+column marks whitelisted users as `VIP用户` (gold) and the rest as
+`普通用户`; its header offers a filter (VIP / 普通) and sorting, and a
+**VIP 用户** card above the table filters by a whitelisted user.
 
 ### `GET /details` (Detail Page)
 
 Every request, filterable by sandbox id (pre-filled from the URL query),
 paginated (50 per page), with an optional 10s auto-refresh and a back
-link to the summary page.
+link to the summary page. A `VIP用户` / `普通用户` marker sits next to
+each row's user id (rows without a user id show `-`).
 
 ### Login (`server.ui_password`)
 
@@ -145,12 +157,17 @@ Query params:
   member sandbox ids (case-insensitive substring; `%`/`_` in the input
   are matched literally) OR exact-match member node IPs - an IP returns
   the groups whose sandboxes sit on that node
-- `sort` - `request_time`, `request_count`, `created_at` or `accessed`;
-  prefix with `-` for descending (default: `-request_time`, newest first;
-  `accessed` ascending puts never-accessed groups first)
+- `sort` - `request_time`, `request_count`, `created_at`, `accessed` or
+  `user_type`; prefix with `-` for descending (default: `-request_time`,
+  newest first; `accessed` ascending puts never-accessed groups first;
+  `user_type` ascending puts 普通用户 first, descending puts VIP users
+  first)
 - `time_from` / `time_to` - ISO 8601 bounds on the latest request time
   (inclusive; naive values are assumed to be UTC); the summary page's
   date pickers send local start-of-day / end-of-day here
+- `user_type` - `vip` keeps only whitelisted users (`whitelist.users`),
+  `normal` keeps the rest (with an empty whitelist every group is
+  normal); omitted = all groups
 - `limit` (1-500, default 50), `offset` (default 0)
 
 ```json
@@ -168,6 +185,34 @@ Query params:
 were all inserted by the cluster discovery and never accessed; such
 groups sort last under the default `-request_time` order.
 
+### `GET /api/sandboxes/times`
+
+One row per sandbox id: `user_id`, `sandbox_id`, `created_at` and
+`request_time` (the latest request time), newest first. Sandboxes that
+were never accessed have no latest request time - their `request_time`
+falls back to the creation time, so no row carries an empty
+`request_time`. Deleted sandboxes are included (their audit history
+stays complete). **Sandboxes of whitelisted users (`whitelist.users`)
+are excluded** - their rows stay out of this usage/lifetime report;
+sandboxes without a user id are still listed.
+
+Authentication: a session cookie (login) or an
+`Authorization: Bearer <password>` header carrying the UI password
+(`server.ui_password`).
+
+Query params: `limit` (1-500, default 50), `offset` (default 0).
+
+```json
+{"total": 2, "items": [
+  {"sandbox_id": "sb-b", "user_id": "7680071018521559040",
+   "created_at": "2026-08-20T09:00:00Z",
+   "request_time": "2026-08-20T10:00:00+00:00"},
+  {"sandbox_id": "sb-c", "user_id": null,
+   "created_at": "2026-08-19T00:00:00Z",
+   "request_time": "2026-08-19T00:00:00Z"}
+]}
+```
+
 ### `GET /api/requests`
 
 List access request details, newest first.
@@ -182,6 +227,22 @@ sandboxes; each row carries `sandbox_deleted`), `limit` (1-500, default
   "uri": "/", "method": "POST", "target": "10.0.0.2:8080",
   "request_time": "2026-08-20T10:00:01+00:00",
   "received_at": "2026-08-20T01:38:55+00:00"}]}
+```
+
+### `GET /api/whitelist`
+
+Returns the whitelisted user ids configured via `whitelist.users` in
+`audit.toml` (it does not change access control or what gets recorded).
+The pages display them as `VIP用户` (gold tag; everyone else shows
+`普通用户`): the summary page shows a **VIP 用户** card (click a tag to
+filter the table by that user) and a 用户类型 column, the details page
+marks each row's user id; an empty list makes the pages show only
+`普通用户` and hide the card. The same list also excludes those users'
+sandboxes from `GET /api/sandboxes/times`. Authentication is the same
+as the other query APIs (session cookie).
+
+```json
+{"users": ["7680071018521559040", "u-2"]}
 ```
 
 ### `POST /api/sync-deleted`

@@ -57,6 +57,26 @@ body {
   margin: 0 0 12px;
 }
 
+/* VIP 用户（白名单）卡片：首页总表上方，点击标签按该用户过滤表格 */
+.whitelist-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  margin-bottom: 16px;
+}
+
+.whitelist-title {
+  font-weight: 600;
+  color: #24292f;
+}
+
+.whitelist-count {
+  margin-left: auto;
+  font-size: 13px;
+}
+
 .uri-cell {
   max-width: 360px;
   overflow: hidden;

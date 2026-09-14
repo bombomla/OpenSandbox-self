@@ -116,6 +116,49 @@ def test_excluded_uri_suffixes_invalid_type_raises(tmp_path):
         load_config(path)
 
 
+def test_default_whitelist_users(tmp_path):
+    config = load_config(tmp_path / "nonexistent.toml")
+
+    assert config["whitelist_users"] == []
+
+
+def test_whitelist_users_multiple_entries(tmp_path):
+    path = write_config(
+        tmp_path,
+        '[whitelist]\nusers = ["u-1", "u-2", "u-3"]\n',
+    )
+
+    config = load_config(path)
+
+    assert config["whitelist_users"] == ["u-1", "u-2", "u-3"]
+
+
+def test_whitelist_users_single_string(tmp_path):
+    path = write_config(tmp_path, '[whitelist]\nusers = "u-1"\n')
+
+    config = load_config(path)
+
+    assert config["whitelist_users"] == ["u-1"]
+
+
+def test_whitelist_users_trims_and_drops_blank_entries(tmp_path):
+    path = write_config(
+        tmp_path,
+        '[whitelist]\nusers = [" u-1 ", "", "  "]\n',
+    )
+
+    config = load_config(path)
+
+    assert config["whitelist_users"] == ["u-1"]
+
+
+def test_whitelist_users_invalid_type_raises(tmp_path):
+    path = write_config(tmp_path, "[whitelist]\nusers = [1, 2]\n")
+
+    with pytest.raises(ValueError, match="whitelist"):
+        load_config(path)
+
+
 def test_unknown_keys_and_sections_ignored(tmp_path):
     path = write_config(
         tmp_path,
