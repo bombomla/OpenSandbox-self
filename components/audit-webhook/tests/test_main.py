@@ -154,32 +154,31 @@ class FakeStore:
                 "user_id": self.user_ids.get(sandbox_id),
             }
 
-        seen: set[str] = set()
-        members: list[dict] = []
+        # Latest request per sandbox (mimics the summary row's
+        # request_time); time filters no longer drop members - they bind
+        # the group's effective request time below.
+        latest: dict[str, object] = {}
         for event in self.events:
             sandbox_id = event["sandbox_id"]
-            if sandbox_id in seen or self.is_deleted(sandbox_id):
+            if sandbox_id not in latest or event["request_time"] > latest[sandbox_id]:
+                latest[sandbox_id] = event["request_time"]
+        seen: set[str] = set()
+        members: list[dict] = []
+        for sandbox_id, request_time in latest.items():
+            if self.is_deleted(sandbox_id) or not matches_search(sandbox_id):
                 continue
-            if not matches_search(sandbox_id):
-                continue
-            if time_from is not None and event["request_time"] < time_from:
-                continue
-            if time_to is not None and event["request_time"] > time_to:
-                continue
-            members.append(member_row(sandbox_id, event["request_time"]))
+            members.append(member_row(sandbox_id, request_time))
             seen.add(sandbox_id)
         # Discovered-but-never-accessed rows: NULL request fields, count 0.
-        # Time filters exclude them (NULL comparisons are not TRUE in SQL).
-        if time_from is None and time_to is None:
-            for sandbox_id, _created_at in self.unaccessed.items():
-                if (
-                    sandbox_id in seen
-                    or self.is_deleted(sandbox_id)
-                    or not matches_search(sandbox_id)
-                ):
-                    continue
-                members.append(member_row(sandbox_id, None))
-                seen.add(sandbox_id)
+        for sandbox_id, _created_at in self.unaccessed.items():
+            if (
+                sandbox_id in seen
+                or self.is_deleted(sandbox_id)
+                or not matches_search(sandbox_id)
+            ):
+                continue
+            members.append(member_row(sandbox_id, None))
+            seen.add(sandbox_id)
         # Group by user: uid = user_id when known, else the sandbox id.
         # Member request_count sums every recorded event (SUM over rows).
         counts: dict[str, int] = {}
@@ -215,7 +214,35 @@ class FakeStore:
             ):
                 group["request_time"] = m["request_time"]
             group["request_count"] += counts.get(m["sandbox_id"], 0)
+        # Fallback (SQL: the per-uid window max over ALL rows, deleted
+        # included): a group whose current sandbox was never accessed
+        # reports the user's latest request from their deleted sandboxes.
+        history: dict[str, object] = {}
+        for event in self.events:
+            uid = self._user_of(event["sandbox_id"])
+            if uid not in history or event["request_time"] > history[uid]:
+                history[uid] = event["request_time"]
+        for group in groups.values():
+            if group["request_time"] is None:
+                group["request_time"] = history.get(group["uid"])
         items = list(groups.values())
+        # Time filters bind the effective (post-fallback) group request
+        # time; a group without any time falls out (NULL comparisons are
+        # not TRUE in SQL).
+        if time_from is not None:
+            items = [
+                item
+                for item in items
+                if item["request_time"] is not None
+                and item["request_time"] >= time_from
+            ]
+        if time_to is not None:
+            items = [
+                item
+                for item in items
+                if item["request_time"] is not None
+                and item["request_time"] <= time_to
+            ]
         # Whitelist (VIP) type filter, mirroring the SQL on the group key.
         if user_type == "vip":
             items = [item for item in items if item["uid"] in whitelist]
@@ -948,6 +975,90 @@ def test_summary_shows_user_current_sandbox(client):
     assert row["user_id"] == "u-1"
     assert row["sandbox_id"] == "sb-a"
     assert row["sandbox_count"] == 1
+
+
+def test_summary_unaccessed_falls_back_to_deleted_request_time(client):
+    """A user whose current sandbox was never accessed reports the latest
+    request of their deleted sandboxes as the group's request_time."""
+    test_client, fake = client
+    fake.user_ids = {"sb-old": "u-1", "sb-new": "u-1"}
+    # The user's previous sandbox was accessed, then removed by the sync.
+    fake.record([
+        {**EVENT, "sandbox_id": "sb-old", "request_time": "2026-08-18T09:24:12.252+08:00"},
+        {**EVENT, "sandbox_id": "sb-old", "request_time": "2026-08-19T09:24:12.252+08:00"},
+    ])
+    fake.sync_deleted_flags([])  # sb-old is gone from the cluster
+    # The current sandbox exists but has no access records yet.
+    fake.upsert_discovered_sandboxes([{
+        "name": "sb-new",
+        "created_at": datetime(2026, 8, 20, tzinfo=timezone.utc),
+        "user_id": "u-1",
+    }])
+
+    response = test_client.get("/api/sandboxes")
+
+    assert response.status_code == 200
+    (row,) = response.json()["items"]
+    assert row["uid"] == "u-1"
+    assert row["sandbox_id"] == "sb-new"
+    assert row["accessed"] is False  # the current sandbox stays 未访问
+    # Falls back to the deleted sandbox's latest request, not its first.
+    assert row["request_time"] == "2026-08-19T09:24:12+08:00"
+    # Only the (unaccessed) current sandbox counts towards the sum.
+    assert row["request_count"] == 0
+
+
+def test_summary_no_fallback_when_current_sandbox_accessed(client):
+    """An accessed current sandbox keeps its own request time even when the
+    user's deleted sandbox was requested more recently."""
+    test_client, fake = client
+    fake.user_ids = {"sb-old": "u-1", "sb-new": "u-1"}
+    fake.record([
+        # Deleted sandbox requested AFTER the current one - still ignored.
+        {**EVENT, "sandbox_id": "sb-old", "request_time": "2026-08-21T09:24:12.252+08:00"},
+    ])
+    fake.sync_deleted_flags(["sb-new"])
+    fake.record([{**EVENT, "sandbox_id": "sb-new"}])
+
+    response = test_client.get("/api/sandboxes")
+
+    assert response.status_code == 200
+    (row,) = response.json()["items"]
+    assert row["accessed"] is True
+    assert row["request_time"] == "2026-08-20T09:24:12+08:00"
+
+
+def test_summary_time_filter_matches_fallback_request_time(client):
+    """time_from/time_to bind the effective request time, so a group whose
+    current sandbox is unaccessed is found via its deleted history."""
+    test_client, fake = client
+    fake.user_ids = {"sb-old": "u-1", "sb-new": "u-1"}
+    fake.record([
+        {**EVENT, "sandbox_id": "sb-old", "request_time": "2026-08-19T09:24:12.252+08:00"},
+    ])
+    fake.sync_deleted_flags([])
+    fake.upsert_discovered_sandboxes([{
+        "name": "sb-new",
+        "created_at": datetime(2026, 8, 20, tzinfo=timezone.utc),
+        "user_id": "u-1",
+    }])
+
+    # The deleted sandbox's request (Aug 19) is inside the window.
+    response = test_client.get(
+        "/api/sandboxes",
+        params={"time_from": "2026-08-19T00:00:00Z", "time_to": "2026-08-19T23:59:59Z"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 1
+    assert data["items"][0]["request_time"] == "2026-08-19T09:24:12+08:00"
+
+    # Outside the window the group falls out (NULL comparisons are not TRUE).
+    response = test_client.get(
+        "/api/sandboxes", params={"time_from": "2026-08-20T00:00:00Z"}
+    )
+    assert response.status_code == 200
+    assert response.json()["total"] == 0
 
 
 def test_user_details_include_deleted_history(client):

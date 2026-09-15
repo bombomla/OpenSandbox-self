@@ -32,7 +32,8 @@ interface SandboxRow {
   accessed: boolean;
   /** earliest member BatchSandbox creationTimestamp */
   created_at: string | null;
-  /** latest member request time */
+  /** latest member request time; when the current sandbox is 未访问 it
+   *  falls back to the user's deleted sandboxes' latest request */
   request_time: string | null;
   /** summed member request count */
   request_count: number;
@@ -338,7 +339,8 @@ function SummaryPage() {
           </div>
           <p className="hint">
             一个用户同一时间最多运行一个沙箱：每行显示用户及其当前沙箱；无用户 ID 的沙箱单独一行。
-            累计请求数为该组所有沙箱之和，最新请求时间取最近一次。点击「访问详情」查看该用户（含历史沙箱）的请求记录；
+            累计请求数为该组所有沙箱之和，最新请求时间取当前沙箱最近一次请求，当前沙箱「未访问」时回退显示该用户已删除沙箱的最新请求（仍表示该用户最近一次活跃时间）。
+            点击「访问详情」查看该用户（含历史沙箱）的请求记录；
             点击「状态」/「创建时间」/「最新请求时间」/「累计请求数」表头排序（降序 ↔ 升序循环）；
             「未访问」表示沙箱存在于集群但尚无访问记录；已从集群移除的沙箱不再显示（其访问记录在详情页仍可查询）；
             搜索框输入节点 IP 可查到该节点上沙箱所属的分组；白名单（VIP）用户在「用户类型」列以金色标识，点击该列表头可按用户类型筛选与排序，上方卡片可点击按该用户过滤

@@ -149,6 +149,30 @@ WHERE (sandbox_access_latest.created_at IS NULL
 RETURNING (xmax = 0) AS inserted
 """.format(now=_TRUNCATED_NOW)
 
+# Per-sandbox rows carrying, next to their own summary fields, the latest
+# request across ALL rows of their group key - deleted sandboxes included.
+# ``history_request_time`` backs the summary fallback: when a user's
+# current (non-deleted) sandbox was never accessed (``request_time`` is
+# NULL), the group reports the user's latest request from their
+# already-removed sandboxes, so the 最新请求时间 column keeps showing
+# when the user was last active. Groups keyed by sandbox id (no user_id)
+# never hit the fallback - a deleted row cannot coexist with a live row
+# of the same sandbox id.
+_LATEST_ALL_ROWS = """
+    SELECT sandbox_id, request_time, request_count, deleted, accessed, created_at,
+           user_id, node_ip,
+           COALESCE(user_id, sandbox_id) AS uid,
+           max(request_time) OVER (PARTITION BY COALESCE(user_id, sandbox_id)) AS history_request_time
+    FROM sandbox_access_latest
+"""
+
+# The group's effective latest request time: the current (non-deleted)
+# sandbox's latest request, or - when it was never accessed - the latest
+# request from the user's deleted sandboxes (see _LATEST_ALL_ROWS). HAVING
+# cannot reference SELECT aliases, so the expression is spelled out and
+# reused by the time filter below.
+_EFF_REQUEST_TIME = "COALESCE(max(request_time), max(history_request_time))"
+
 # Summary listing grouped by user. A user runs at most one sandbox at a
 # time, so a non-deleted member set per user is normally exactly one
 # row: the listing reports that current sandbox (``sandbox_id``) next
@@ -156,18 +180,18 @@ RETURNING (xmax = 0) AS inserted
 # multi-active case. Sandboxes without a user_id fall back to
 # per-sandbox stats (uid = sandbox id, user_id NULL). The member CTE
 # filters first, so a group is included when any member matches the
-# search/time filters. Deleted history is hidden here but stays
-# queryable through /api/requests (the user filter includes it).
+# search/user_type filters; the time filters bind the group's effective
+# latest request time (deleted-sandbox fallback included) via HAVING.
+# Deleted history is hidden here but stays queryable through
+# /api/requests (the user filter includes it).
 # The window count piggybacks the total on the listing query so a page
 # load costs one round trip instead of two; the plain COUNT remains as
 # a fallback for pages past the end (no rows returned -> no total known).
-_LIST_LATEST = """
-WITH member AS (
-    SELECT sandbox_id, request_time, request_count, accessed, created_at,
-           COALESCE(user_id, sandbox_id) AS uid, user_id, node_ip
-    FROM sandbox_access_latest
-    WHERE NOT deleted {extra}
-)
+_LIST_LATEST = (
+    "WITH all_rows AS ("
+    + _LATEST_ALL_ROWS
+    + """),
+member AS (SELECT * FROM all_rows WHERE NOT deleted {extra})
 SELECT uid,
        max(user_id) AS user_id,
        max(sandbox_id) AS sandbox_id,
@@ -175,23 +199,28 @@ SELECT uid,
        count(*) AS sandbox_count,
        bool_and(accessed) AS accessed,
        min(created_at) AS created_at,
-       max(request_time) AS request_time,
-       sum(request_count) AS request_count,
+       """
+    + f"{_EFF_REQUEST_TIME} AS request_time,\n"
+    + """       sum(request_count) AS request_count,
        count(*) OVER () AS __total
 FROM member
 GROUP BY uid
+HAVING {having}
 ORDER BY {order}
 LIMIT %(limit)s OFFSET %(offset)s
 """
-
-_COUNT_LATEST = """
-WITH member AS (
-    SELECT COALESCE(user_id, sandbox_id) AS uid
-    FROM sandbox_access_latest
-    WHERE NOT deleted {extra}
 )
-SELECT count(*) AS total FROM (SELECT uid FROM member GROUP BY uid) AS groups
+
+_COUNT_LATEST = (
+    "WITH all_rows AS ("
+    + _LATEST_ALL_ROWS
+    + """),
+member AS (SELECT * FROM all_rows WHERE NOT deleted {extra})
+SELECT count(*) AS total FROM (
+    SELECT uid FROM member GROUP BY uid HAVING {having}
+) AS groups
 """
+)
 
 # Whitelisted sort orders for the grouped summary listing. Never-accessed
 # rows have a NULL request_time and always sort last within an accessed
@@ -307,15 +336,20 @@ class AuditStore:
         ``user_id = NULL``. Rows whose sandbox resource is gone
         (``deleted = TRUE``) are hidden from the listing - the audit
         history of removed ephemeral sandboxes stays queryable through
-        ``list_details``. ``search`` matches user ids / sandbox ids by
-        substring (case-insensitive, fuzzy) OR node IPs exactly - typing
-        an IP returns every sandbox on that node (a group is included
-        when any member matches). ``time_from``/``time_to`` bind the
-        latest request time (inclusive; naive timestamps are assumed to
-        be UTC). ``sort`` is a whitelisted key from ``_LATEST_ORDERS``
-        (``-`` prefix means descending); default is newest first. The
-        group's ``node_ip`` is its current sandbox's node (a NULL when
-        the pod is not scheduled yet).
+        ``list_details``. When the user's current sandbox was never
+        accessed (``未访问``), the group's ``request_time`` falls back to
+        the latest request of the user's deleted sandboxes, so the
+        latest-request column still shows when the user was last active.
+        ``search`` matches user ids / sandbox ids by substring
+        (case-insensitive, fuzzy) OR node IPs exactly - typing an IP
+        returns every sandbox on that node (a group is included when
+        any member matches). ``time_from``/``time_to`` bind the group's
+        effective latest request time, fallback included (inclusive;
+        naive timestamps are assumed to be UTC). ``sort`` is a
+        whitelisted key from ``_LATEST_ORDERS`` (``-`` prefix means
+        descending); default is newest first. The group's ``node_ip``
+        is its current sandbox's node (a NULL when the pod is not
+        scheduled yet).
 
         ``whitelist_users`` marks the VIP users (``[whitelist] users``):
         ``user_type = "vip"`` keeps only groups whose key is in it,
@@ -333,6 +367,11 @@ class AuditStore:
             "whitelist": whitelist_users or [],
         }
         conditions = []
+        # Time filters go to HAVING (they bind the group's effective
+        # request time, fallback included); search/user_type filter the
+        # member rows. HAVING cannot reference SELECT aliases, hence the
+        # spelled-out _EFF_REQUEST_TIME expression.
+        having = []
         if search:
             # Fuzzy match on the group key (user id or bare sandbox id) OR
             # member sandbox ids OR exact member node_ip; escape LIKE
@@ -352,16 +391,22 @@ class AuditStore:
             conditions.append("COALESCE(user_id, sandbox_id) <> ALL(%(whitelist)s)")
         if time_from is not None:
             params["time_from"] = _ensure_utc(time_from)
-            conditions.append("request_time >= %(time_from)s")
+            having.append(f"{_EFF_REQUEST_TIME} >= %(time_from)s")
         if time_to is not None:
             params["time_to"] = _ensure_utc(time_to)
-            conditions.append("request_time <= %(time_to)s")
+            having.append(f"{_EFF_REQUEST_TIME} <= %(time_to)s")
         extra = f" AND {' AND '.join(conditions)}" if conditions else ""
+        having_clause = " AND ".join(having) if having else "TRUE"
 
         with self.pool.connection() as conn:
             conn.row_factory = dict_row
             with conn.cursor() as cur:
-                cur.execute(_LIST_LATEST.format(extra=extra, order=order), params)
+                cur.execute(
+                    _LIST_LATEST.format(
+                        extra=extra, having=having_clause, order=order
+                    ),
+                    params,
+                )
                 rows = cur.fetchall()
                 if rows:
                     total = rows[0]["__total"]
@@ -369,7 +414,10 @@ class AuditStore:
                 else:
                     # Past the last page: the window count returned nothing,
                     # fall back to a separate COUNT for the true total.
-                    cur.execute(_COUNT_LATEST.format(extra=extra), params)
+                    cur.execute(
+                        _COUNT_LATEST.format(extra=extra, having=having_clause),
+                        params,
+                    )
                     total = cur.fetchone()["total"]
         return {"total": total, "items": [_jsonify(row) for row in rows]}
 

@@ -385,7 +385,12 @@ def list_sandboxes(
     Rows are grouped by ``user_id`` when the cluster sync resolved one;
     sandboxes without a user id report per-sandbox stats. All of a
     user's sandboxes share one summed ``request_count`` and the latest
-    ``request_time`` (see ``store.list_latest``).
+    ``request_time`` (see ``store.list_latest``). When the user's
+    current sandbox was never accessed (``未访问``), the group's
+    ``request_time`` falls back to the latest request of the user's
+    already-deleted sandboxes, so the latest-request column still
+    shows when the user was last active; ``time_from``/``time_to``
+    bind that effective time.
 
     ``user_type=vip`` keeps whitelisted users (``[whitelist] users``),
     ``user_type=normal`` the rest; ``sort=user_type`` /

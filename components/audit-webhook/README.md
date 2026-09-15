@@ -162,9 +162,10 @@ Query params:
   newest first; `accessed` ascending puts never-accessed groups first;
   `user_type` ascending puts 普通用户 first, descending puts VIP users
   first)
-- `time_from` / `time_to` - ISO 8601 bounds on the latest request time
-  (inclusive; naive values are assumed to be UTC); the summary page's
-  date pickers send local start-of-day / end-of-day here
+- `time_from` / `time_to` - ISO 8601 bounds on the group's effective
+  latest request time (inclusive; naive values are assumed to be UTC);
+  the summary page's date pickers send local start-of-day / end-of-day
+  here
 - `user_type` - `vip` keeps only whitelisted users (`whitelist.users`),
   `normal` keeps the rest (with an empty whitelist every group is
   normal); omitted = all groups
@@ -182,8 +183,12 @@ Query params:
 ```
 
 `accessed` is `false` (and `request_count` `0`) on groups whose members
-were all inserted by the cluster discovery and never accessed; such
-groups sort last under the default `-request_time` order.
+were all inserted by the cluster discovery and never accessed. When the
+user's current sandbox is never-accessed, the group's `request_time`
+falls back to the latest request of the user's already-deleted
+sandboxes, so the 最新请求时间 column still shows when the user was
+last active; a group with no request at all sorts last under the
+default `-request_time` order.
 
 ### `GET /api/sandboxes/times`
 
