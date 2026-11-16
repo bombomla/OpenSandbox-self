@@ -8,7 +8,7 @@ A FastAPI service that receives sandbox access audit events from the
 The ingress posts one JSON event per routed request when started with
 `--audit-enabled --audit-webhook-url http://<this-service>:8080/events`.
 
-Two tables are maintained (auto-created on startup):
+Tables (auto-created on startup):
 
 - `sandbox_access_log` — **请求详情表**: one row per request.
 - `sandbox_access_latest` - **总表**: one row per sandbox id, holding the
@@ -16,6 +16,8 @@ Two tables are maintained (auto-created on startup):
   whose sandbox id has no row yet are inserted with `accessed = FALSE`
   (request fields NULL) and shown in the UI as `未访问`; each row also
   carries the node IP of the node its sandbox pod runs on.
+- `alertmanager_alert` — **告警表**: one row per alert delivered by
+  Alertmanager (append-only; firing and resolved deliveries both stay).
 
 A built-in web UI (React + Ant Design; source in `frontend/`, built
 output in `static/`) displays the records on two pages (password
@@ -36,6 +38,11 @@ protected when `server.ui_password` is set):
   `普通用户` marker next to each row's user id.
 - `GET /login` - password login page (session cookie, 7-day validity).
 
+The service also receives **Alertmanager webhook notifications** at
+`POST /alerts` (each delivered alert is appended to an
+`alertmanager_alert` table, queryable via `GET /api/alerts`); a Bearer
+token (`[alerts] auth_token`) gates delivery when set.
+
 ## Quick Start
 
 ```bash
@@ -50,17 +57,23 @@ Configuration is read from `audit.toml` (next to `main.py`); point
 file means "use defaults"; a malformed file fails startup.
 
 Endpoints: `POST /events` (audit events; `POST /` is an alias, so a
-path-less webhook URL also works), `GET /` (summary page), `GET /details`
+path-less webhook URL also works), `POST /alerts` (Alertmanager
+webhook), `GET /` (summary page), `GET /details`
 (detail page), `GET /login` / `POST /login` / `POST /logout` (UI auth),
 `GET /api/sandboxes` and `GET /api/requests` (JSON queries),
 `GET /api/sandboxes/times` (per-sandbox creation and latest request
-times), `GET /api/whitelist` (configured whitelist users),
+times), `GET /api/host-sandboxes` (live sandboxes on a host, with an
+optional `stale_days` filter), `GET /api/alerts` (received Alertmanager
+alerts), `GET /api/whitelist` (configured whitelist users),
 `POST /api/sync-deleted` (mark deleted sandboxes),
 `GET /status.ok`
-(health).
+(health). The full machine-readable contract is served by the built-in
+Swagger UI at `/docs` (OpenAPI schema at `/openapi.json`).
 
 Event ingestion (`POST /events`) is never password protected - the ingress
-must deliver events without a session.
+must deliver events without a session. Alert ingestion (`POST /alerts`)
+is open until `[alerts] auth_token` is set, after which deliveries must
+carry `Authorization: Bearer <token>`.
 
 Then start the ingress pointing at this service:
 
@@ -88,6 +101,13 @@ is optional - defaults are shown below.
 | `kubernetes.namespace` | (empty) | Namespace whose `batchsandboxes.sandbox.opensandbox.io` resources mark live sandbox ids (the resource name is the sandbox id; required by the sync) |
 | `kubernetes.sync_interval` | `0` | When > 0 (seconds), sync against the cluster periodically in the background (discover unaccessed sandboxes + reconcile the `deleted` flags); `0` = manual sync via `POST /api/sync-deleted` only |
 | `whitelist.users` | `[]` | User ids displayed as `VIP用户` on the summary page (用户类型 column + clickable **VIP 用户** card) and on the details page (marker next to the user id), everyone else as `普通用户`; their sandboxes are also excluded from `GET /api/sandboxes/times`. It does not change access control or audit recording (`/api/sandboxes`, `/api/requests` and ingestion are unaffected) |
+| `alerts.auth_token` | (empty) | Bearer token for the Alertmanager webhook (`POST /alerts`). When non-empty, deliveries must carry `Authorization: Bearer <token>` - configure the same token in the Alertmanager receiver's `http_config`. Empty = no authentication. Independent of `server.ui_password` |
+| `alerts.memory_alert_names` | `[]` | Alertnames treated as host memory alerts: a firing alert whose alertname is listed here triggers a stale-user lookup for its host (the `instance` label, `IP:port` - the port is stripped). Empty list = the lookup is off |
+| `alerts.stale_days` | `7` | Stale-user threshold in days for the memory-alert lookup |
+| `alerts.stop_sandboxes` | `false` | Auto-stop switch: when enabled, a firing memory alert whose lookup found stale users also stops the first `stop_limit` (most stale) users' sandbox services. Keep off until you've validated the `stale_users` output |
+| `alerts.stop_url` | `http://10.68.205.224:8000/claw-catalog/stop` | Stop endpoint; receives `{"external_user_id": <user_id>, "slug": <stop_slug>}` |
+| `alerts.stop_slug` | `v20260427` | `slug` value sent with every stop call |
+| `alerts.stop_limit` | `10` | Max users stopped per alerting host |
 | `log.level` | `INFO` | Log level |
 
 ## API
@@ -111,6 +131,119 @@ Responses:
 - `200 {"accepted": <n>}` — recorded
 - `422` — invalid payload (rejected, ingress will log a delivery error)
 - `502` — database write failed
+
+### `POST /alerts` (Alertmanager Webhook)
+
+Receives an [Alertmanager](https://prometheus.io/docs/alerting/latest/configuration/#webhook_config)
+webhook notification (version 4 payload, camelCase as Alertmanager sends
+it; unknown fields are ignored). Every alert of the notification is
+appended to the `alertmanager_alert` table as delivered - a later
+`resolved` notification adds a row, it does not rewrite the `firing`
+one. The envelope fields (`receiver`, `groupKey`) are repeated on each
+row. Alertmanager's zero `endsAt` (`0001-01-01T00:00:00Z`, meaning
+"still firing") is stored as `NULL`; timestamps are truncated to whole
+seconds. A `truncatedAlerts` count above zero is logged as a warning.
+
+```json
+{
+  "version": "4",
+  "groupKey": "{}:{\"alertname\":\"HighMemory\"}",
+  "truncatedAlerts": 0,
+  "status": "firing",
+  "receiver": "audit-webhook",
+  "groupLabels": {"alertname": "HighMemory"},
+  "commonLabels": {"alertname": "HighMemory", "severity": "warning"},
+  "commonAnnotations": {"summary": "内存使用过高"},
+  "externalURL": "http://alertmanager:9093",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {"alertname": "HighMemory", "instance": "pod-1", "severity": "warning"},
+      "annotations": {"summary": "内存使用过高"},
+      "startsAt": "2026-09-24T08:00:00.123456789Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://prometheus:9090/graph",
+      "fingerprint": "abc123"
+    }
+  ]
+}
+```
+
+Stale-user lookup: a firing alert whose alertname is listed in
+`[alerts] memory_alert_names` identifies its host via the `instance`
+label (node_exporter style `IP:port` - the port is stripped) and lists
+the users whose live sandboxes sit on that host and were not accessed
+for more than `[alerts] stale_days` days (VIP/whitelisted users
+excluded). A user's effective last access is their current sandbox's
+latest request, or - when it was never accessed - the latest request of
+their already-deleted sandboxes (the same fallback the summary page
+shows), or the sandbox's creation time; a user without any recorded
+timestamp counts as stale. The list is logged as a warning and attached
+to the response as `stale_users` (omitted when nothing matched); a
+failed lookup is logged but never fails the delivery.
+
+```json
+{"accepted": 1, "stale_users": [
+  {"host": "10.0.0.1", "alertname": "HighMemory", "users": [
+    {"user_id": "7680071018521559040", "sandbox_id": "610c205a-272e-425f-85bf-b27cae2d9ee3",
+     "last_access": "2026-09-01T08:00:00Z", "days": 38}
+  ], "stopped": 0, "failed": 0}
+]}
+```
+
+Auto-stop (`[alerts] stop_sandboxes`): when enabled, the first
+`[alerts] stop_limit` (most stale) users of each alerting host are
+stopped by POSTing `{"external_user_id": <user_id>, "slug":
+[alerts] stop_slug}` to `[alerts] stop_url` (the claw-catalog stop
+endpoint) - the counters land on the host entry as `stopped` / `failed`
+(both `0` when the switch is off). A failed call is logged without
+affecting the rest or the delivery itself.
+
+Authentication: none when `[alerts] auth_token` is empty; otherwise an
+`Authorization: Bearer <token>` header is required. Configure the same
+token on the Alertmanager side:
+
+```yaml
+receivers:
+  - name: audit-webhook
+    webhook_configs:
+      - url: http://audit-webhook:8080/alerts
+        http_config:
+          authorization:
+            type: Bearer
+            credentials: "<[alerts] auth_token>"
+```
+
+Responses:
+- `200 {"accepted": <n>}` — alerts recorded (0 for a notification without alerts); carries `"stale_users": [...]` when a firing memory alert found stale users (see above)
+- `401` — token required and missing/wrong (`[alerts] auth_token` set)
+- `422` — invalid payload
+- `502` — database write failed
+
+### `GET /api/alerts`
+
+List alerts received from Alertmanager, newest delivery first
+(authenticated like the other query APIs - a session cookie when
+`server.ui_password` is set).
+
+Query params:
+- `status` - `firing` or `resolved` filter
+- `search` - fuzzy-match fingerprints, receivers, group keys and the
+  JSON text of labels/annotations (alertname, instance, severity,
+  summary etc. all hit with one field)
+- `limit` (1-500, default 50), `offset` (default 0)
+
+```json
+{"total": 1, "items": [
+  {"id": 2, "fingerprint": "abc123", "status": "firing",
+   "receiver": "audit-webhook", "group_key": "{}:{\"alertname\":\"HighMemory\"}",
+   "labels": {"alertname": "HighMemory", "instance": "pod-1", "severity": "warning"},
+   "annotations": {"summary": "内存使用过高"},
+   "starts_at": "2026-09-24T08:00:00Z", "ends_at": null,
+   "generator_url": "http://prometheus:9090/graph",
+   "received_at": "2026-09-24T08:00:05Z"}
+]}
+```
 
 ### `GET /` (Summary Page)
 
@@ -316,6 +449,23 @@ CREATE TABLE sandbox_access_latest (
     user_id       TEXT,                 -- claw-data 卷 subPath 中的用户 ID（集群同步填充）
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 告警表：Alertmanager 每次送达的告警一行（追加式，firing 与 resolved 都保留）
+CREATE TABLE alertmanager_alert (
+    id            BIGSERIAL PRIMARY KEY,
+    fingerprint   TEXT        NOT NULL DEFAULT '',  -- Alertmanager 告警指纹
+    status        TEXT        NOT NULL,             -- firing / resolved
+    receiver      TEXT,                              -- 通知信封字段，逐行冗余
+    group_key     TEXT,
+    labels        JSONB       NOT NULL DEFAULT '{}',
+    annotations   JSONB       NOT NULL DEFAULT '{}',
+    starts_at     TIMESTAMPTZ,                      -- 告警开始时间
+    ends_at       TIMESTAMPTZ,                      -- 结束时间（仍 firing 时为 NULL）
+    generator_url TEXT,                              -- Prometheus 图表链接
+    received_at   TIMESTAMPTZ NOT NULL DEFAULT now() -- webhook 收到的时间
+);
+CREATE INDEX idx_alertmanager_alert_start
+    ON alertmanager_alert (starts_at DESC);
 ```
 
 Behavior notes:
@@ -348,6 +498,12 @@ Behavior notes:
   subPath (e.g. `claw/7680071018521559040/v20250729/...` ->
   `7680071018521559040`) on every sync. Sandboxes without that mount or
   a differently-shaped subPath show `null`.
+- Alertmanager alerts (`POST /alerts`) are append-only: each delivered
+  alert is one `alertmanager_alert` row; a `resolved` delivery adds a
+  row instead of updating the `firing` one. The zero `endsAt` sentinel
+  (`0001-01-01T00:00:00Z`, "still firing") is stored as NULL; labels and
+  annotations land as JSONB; timestamps follow the same UTC/truncation
+  rules as audit events.
 
 ## Docker
 

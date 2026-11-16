@@ -17,11 +17,13 @@
 Uses a fake store so no PostgreSQL instance is required.
 """
 
+import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.error import HTTPError
 
 import pytest
-from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 
 # Tests live in tests/; the webhook sources are one level up (main.py,
@@ -32,12 +34,13 @@ for _path in (str(_ROOT), str(_ROOT / "utils")):
         sys.path.insert(0, _path)
 
 import main
-from store import _normalize
+from store import _normalize, _normalize_alert
 
 
 class FakeStore:
     def __init__(self):
         self.events = []
+        self.alerts = []
         self.fail = False
         self.deleted_ids = set()
         self.unaccessed = {}  # sandbox_id -> created_at
@@ -46,6 +49,11 @@ class FakeStore:
         self.created_at = {}
         self.node_ips = {}  # sandbox_id -> node IP
         self.user_ids = {}  # sandbox_id -> user id
+        # Toggle to make only the stale-user lookup fail (ingestion stays
+        # up, mirroring the route's error isolation).
+        self.stale_fail = False
+        # Every list_stale_users call: (node_ip, stale_days, exclude_users).
+        self.stale_queries = []
 
     def init_schema(self):
         pass
@@ -59,6 +67,48 @@ class FakeStore:
             self.created_at.setdefault(event["sandbox_id"], None)
             self.unaccessed.pop(event["sandbox_id"], None)
         return len(events)
+
+    def record_alerts(self, alerts):
+        # Mirrors AuditStore.record_alerts: append-only, one row per
+        # delivered alert, normalized like the SQL write path.
+        if self.fail:
+            raise RuntimeError("db down")
+        for alert in alerts:
+            row = _normalize_alert(alert)
+            row["id"] = len(self.alerts) + 1  # BIGSERIAL
+            row["received_at"] = row["starts_at"]  # DB default now()
+            self.alerts.append(row)
+        return len(alerts)
+
+    def list_alerts(self, status=None, search=None, limit=50, offset=0):
+        if self.fail:
+            raise RuntimeError("db down")
+
+        def matches(alert):
+            if status is not None and alert["status"] != status:
+                return False
+            if search is not None:
+                # Mirrors the SQL: ILIKE across fingerprint, receiver,
+                # group_key and the JSON text of labels/annotations.
+                haystack = " ".join(
+                    [
+                        alert["fingerprint"],
+                        alert["receiver"] or "",
+                        alert["group_key"] or "",
+                        json.dumps(alert["labels"], ensure_ascii=False),
+                        json.dumps(alert["annotations"], ensure_ascii=False),
+                    ]
+                )
+                if search.lower() not in haystack.lower():
+                    return False
+            return True
+
+        items = sorted(
+            (alert for alert in self.alerts if matches(alert)),
+            key=lambda alert: alert["id"],
+            reverse=True,
+        )
+        return {"total": len(items), "items": items[offset : offset + limit]}
 
     def upsert_discovered_sandboxes(self, sandboxes):
         if self.fail:
@@ -255,6 +305,51 @@ class FakeStore:
             "search": search,
         }
 
+    def list_host_sandboxes(self, node_ip, stale_days=None):
+        # Mirrors AuditStore.list_host_sandboxes: live (non-deleted) rows
+        # on the node, one row per sandbox with user_id, created_at and
+        # request_time (NULL when never accessed). stale_days keeps only
+        # rows whose effective last-active time (request_time, else
+        # created_at) is older than that many days; a row with no
+        # timestamp at all counts as stale. Least-recently-active first.
+        if self.fail:
+            raise RuntimeError("db down")
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=stale_days)
+            if stale_days is not None
+            else None
+        )
+        latest = {}
+        for event in self.events:
+            sb = event["sandbox_id"]
+            if sb not in latest or event["request_time"] > latest[sb]:
+                latest[sb] = event["request_time"]
+        _floor = datetime.min.replace(tzinfo=timezone.utc)
+        items = []
+        for sandbox_id in self.created_at:
+            if self.is_deleted(sandbox_id):
+                continue
+            if self.node_ips.get(sandbox_id) != node_ip:
+                continue
+            request_time = latest.get(sandbox_id)
+            created_at = self.created_at.get(sandbox_id)
+            last_active = request_time or created_at
+            if cutoff is not None:
+                if last_active is not None and last_active >= cutoff:
+                    continue
+                # last_active None -> stale (no timestamp at all).
+            items.append(
+                {
+                    "sandbox_id": sandbox_id,
+                    "user_id": self.user_ids.get(sandbox_id),
+                    "created_at": created_at,
+                    "request_time": request_time,
+                }
+            )
+        # ORDER BY COALESCE(request_time, created_at) ASC NULLS FIRST.
+        items.sort(key=lambda item: (item["request_time"] or item["created_at"]) or _floor)
+        return {"total": len(items), "items": items}
+
     def list_details(self, sandbox_id=None, user_id=None, limit=50, offset=0):
         if self.fail:
             raise RuntimeError("db down")
@@ -330,6 +425,84 @@ class FakeStore:
         self.deleted_ids = (prev_deleted | all_ids) - live
         return {"deleted": len(deleted), "restored": len(restored)}
 
+    def list_stale_users(self, node_ip, stale_days=7, exclude_users=None):
+        # Mirrors AuditStore.list_stale_users: live rows on the node with
+        # a user id, one group per user. The group's effective last access
+        # is its current sandbox's latest request, or - when it was never
+        # accessed - the user's latest request across all their rows
+        # (deleted sandboxes included), or the sandbox's creation time. A
+        # group without any timestamp counts as stale; a group older than
+        # the cutoff (stale_days) is stale. VIP users drop out.
+        if self.stale_fail:
+            raise RuntimeError("db down")
+        self.stale_queries.append((node_ip, stale_days, list(exclude_users or [])))
+        excluded = set(exclude_users or [])
+        cutoff = datetime.now(timezone.utc) - timedelta(days=stale_days)
+        # Latest request per sandbox (the summary row's request_time).
+        latest = {}
+        for event in self.events:
+            sandbox_id = event["sandbox_id"]
+            if sandbox_id not in latest or event["request_time"] > latest[sandbox_id]:
+                latest[sandbox_id] = event["request_time"]
+        # Live member rows on the node with a resolved user id.
+        members = [
+            sandbox_id
+            for sandbox_id in self.created_at
+            if not self.is_deleted(sandbox_id)
+            and self.node_ips.get(sandbox_id) == node_ip
+            and self.user_ids.get(sandbox_id) is not None
+            and self.user_ids[sandbox_id] not in excluded
+        ]
+        # The user's latest request across ALL rows, deleted included
+        # (mirrors the all_rows window).
+        history = {}
+        for event in self.events:
+            uid = self._user_of(event["sandbox_id"])
+            if uid not in history or event["request_time"] > history[uid]:
+                history[uid] = event["request_time"]
+        groups = {}
+        for sandbox_id in members:
+            uid = self.user_ids[sandbox_id]
+            group = groups.setdefault(
+                uid,
+                {"user_id": uid, "sandbox_id": None, "request": None, "created": None},
+            )
+            if group["sandbox_id"] is None or sandbox_id > group["sandbox_id"]:
+                group["sandbox_id"] = sandbox_id
+            request_time = latest.get(sandbox_id)
+            if request_time is not None and (
+                group["request"] is None or request_time > group["request"]
+            ):
+                group["request"] = request_time
+            created_at = self.created_at.get(sandbox_id)
+            if created_at is not None and (
+                group["created"] is None or created_at < group["created"]
+            ):
+                group["created"] = created_at
+        items = []
+        for group in groups.values():
+            # COALESCE(max(request_time), history, min(created_at)); a
+            # group without any timestamp at all counts as stale.
+            last = group["request"] or history.get(group["user_id"]) or group["created"]
+            if last is not None and last >= cutoff:
+                continue
+            items.append(
+                {
+                    "user_id": group["user_id"],
+                    "sandbox_id": group["sandbox_id"],
+                    "last_access": (
+                        last.replace(microsecond=0).isoformat()
+                        if last is not None
+                        else None
+                    ),
+                }
+            )
+        # ORDER BY last_access ASC NULLS FIRST
+        items.sort(
+            key=lambda item: (item["last_access"] is not None, item["last_access"])
+        )
+        return items
+
 
 @pytest.fixture()
 def client(monkeypatch):
@@ -340,6 +513,16 @@ def client(monkeypatch):
     # monkeypatch themselves).
     monkeypatch.setattr(main, "UI_PASSWORD", "")
     monkeypatch.setattr(main, "WHITELIST_USERS", [])
+    monkeypatch.setattr(main, "ALERT_AUTH_TOKEN", "")
+    # Memory-alert stale-user lookup is off by default (empty alertname
+    # list); tests that exercise it override MEMORY_ALERT_NAMES.
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", [])
+    monkeypatch.setattr(main, "STALE_DAYS", 7)
+    # Auto-stop is off by default; stop-calling tests override these.
+    monkeypatch.setattr(main, "STOP_SANDBOXES", False)
+    monkeypatch.setattr(main, "STOP_URL", "")
+    monkeypatch.setattr(main, "STOP_SLUG", "")
+    monkeypatch.setattr(main, "STOP_LIMIT", 10)
     # Bypass the lifespan (which opens a real PostgreSQL pool) by injecting
     # the fake store directly into app state.
     main.app.state.store = fake
@@ -354,6 +537,45 @@ EVENT = {
     "method": "GET",
     "target": "10.0.0.1:8080",
     "request_time": "2026-08-20T09:24:12.252+08:00",
+}
+
+# A full Alertmanager webhook notification (version 4, camelCase as
+# Alertmanager sends it). startsAt carries Alertmanager's nanosecond
+# precision; endsAt "0001-01-01T00:00:00Z" means "still firing".
+ALERTMANAGER_PAYLOAD = {
+    "version": "4",
+    "groupKey": '{}:{"alertname":"HighMemory"}',
+    "truncatedAlerts": 0,
+    "status": "firing",
+    "receiver": "audit-webhook",
+    "groupLabels": {"alertname": "HighMemory"},
+    "commonLabels": {"alertname": "HighMemory", "severity": "warning"},
+    "commonAnnotations": {"summary": "内存使用过高"},
+    "externalURL": "http://alertmanager:9093",
+    "alerts": [
+        {
+            "status": "firing",
+            "labels": {
+                "alertname": "HighMemory",
+                "instance": "pod-1",
+                "severity": "warning",
+            },
+            "annotations": {"summary": "内存使用过高"},
+            "startsAt": "2026-09-24T08:00:00.123456789Z",
+            "endsAt": "0001-01-01T00:00:00Z",
+            "generatorURL": "http://prometheus:9090/graph",
+            "fingerprint": "abc123",
+        },
+        {
+            "status": "resolved",
+            "labels": {"alertname": "HighCPU", "instance": "pod-2"},
+            "annotations": {},
+            "startsAt": "2026-09-23T08:00:00Z",
+            "endsAt": "2026-09-24T09:00:00Z",
+            "generatorURL": "http://prometheus:9090/graph",
+            "fingerprint": "def456",
+        },
+    ],
 }
 
 
@@ -870,6 +1092,132 @@ def test_list_sandbox_times_excludes_whitelisted_users(monkeypatch, client):
     assert {item["sandbox_id"] for item in data["items"]} == {"sb-b", "sb-c"}
 
 
+# ---------------------------------------------------------------------------
+# Host-sandbox query (GET /api/host-sandboxes)
+# ---------------------------------------------------------------------------
+
+def test_list_host_sandboxes(client):
+    """One row per live sandbox on the host, least-recently-active first."""
+    test_client, fake = client
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    _seed(fake, "sb-recent", "10.0.0.1", user_id="u-1",
+          request_time=now - timedelta(days=1))
+    _seed(fake, "sb-idle", "10.0.0.1", user_id="u-2",
+          request_time=now - timedelta(days=5))
+    # On another host - excluded.
+    _seed(fake, "sb-other", "10.0.0.2", user_id="u-3",
+          request_time=now - timedelta(days=1))
+
+    response = test_client.get("/api/host-sandboxes", params={"node_ip": "10.0.0.1"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    # Least-recently-active first: sb-idle (5 days) before sb-recent (1 day).
+    assert [item["sandbox_id"] for item in data["items"]] == ["sb-idle", "sb-recent"]
+    by_sb = {item["sandbox_id"]: item for item in data["items"]}
+    assert by_sb["sb-recent"]["user_id"] == "u-1"
+    # FastAPI encodes UTC datetimes with a trailing Z.
+    assert by_sb["sb-recent"]["request_time"] == (
+        now - timedelta(days=1)
+    ).isoformat().replace("+00:00", "Z")
+
+
+def test_list_host_sandboxes_stale_days(client):
+    """stale_days keeps only sandboxes idle for more than N days; a
+    never-accessed sandbox is stale since its creation time."""
+    test_client, fake = client
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    _seed(fake, "sb-recent", "10.0.0.1", user_id="u-1",
+          request_time=now - timedelta(days=1))
+    _seed(fake, "sb-stale", "10.0.0.1", user_id="u-2",
+          request_time=now - timedelta(days=10))
+    # Never accessed but created long ago - stale since creation.
+    _seed(fake, "sb-old-fresh", "10.0.0.1", user_id="u-3",
+          created_at=now - timedelta(days=20))
+
+    response = test_client.get(
+        "/api/host-sandboxes", params={"node_ip": "10.0.0.1", "stale_days": 7}
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    sbs = {item["sandbox_id"] for item in data["items"]}
+    assert sbs == {"sb-stale", "sb-old-fresh"}
+    unaccessed = next(
+        item for item in data["items"] if item["sandbox_id"] == "sb-old-fresh"
+    )
+    # request_time is null for never-accessed; created_at carries the time.
+    assert unaccessed["request_time"] is None
+    assert unaccessed["created_at"] == (
+        now - timedelta(days=20)
+    ).isoformat().replace("+00:00", "Z")
+
+
+def test_list_host_sandboxes_excludes_deleted(client):
+    """Deleted sandboxes on the host are hidden - only live ones sit on a host."""
+    test_client, fake = client
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    _seed(fake, "sb-live", "10.0.0.1", user_id="u-1",
+          request_time=now - timedelta(days=1))
+    _seed(fake, "sb-gone", "10.0.0.1", user_id="u-2",
+          request_time=now - timedelta(days=10))
+    fake.sync_deleted_flags(["sb-live"])  # sb-gone removed from the cluster
+
+    response = test_client.get("/api/host-sandboxes", params={"node_ip": "10.0.0.1"})
+
+    assert response.status_code == 200
+    sbs = {item["sandbox_id"] for item in response.json()["items"]}
+    assert sbs == {"sb-live"}
+
+
+def test_list_host_sandboxes_strips_port(client):
+    """An Alertmanager-style instance label (IP:port) is accepted; the
+    :port is stripped before matching node_ip."""
+    test_client, fake = client
+    _seed(fake, "sb-a", "10.0.0.1", user_id="u-1",
+          request_time=datetime.now(timezone.utc).replace(microsecond=0))
+
+    response = test_client.get(
+        "/api/host-sandboxes", params={"node_ip": "10.0.0.1:9100"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+
+
+def test_list_host_sandboxes_bearer_auth(monkeypatch, client):
+    """/api/host-sandboxes accepts a session cookie or a Bearer password."""
+    monkeypatch.setattr(main, "UI_PASSWORD", "secret")
+    test_client, fake = client
+    _seed(fake, "sb-a", "10.0.0.1", user_id="u-1",
+          request_time=datetime.now(timezone.utc).replace(microsecond=0))
+
+    # No credentials -> 401.
+    assert test_client.get(
+        "/api/host-sandboxes", params={"node_ip": "10.0.0.1"}
+    ).status_code == 401
+
+    # Bearer password -> 200.
+    response = test_client.get(
+        "/api/host-sandboxes",
+        params={"node_ip": "10.0.0.1"},
+        headers={"Authorization": "Bearer secret"},
+    )
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+
+
+def test_list_host_sandboxes_query_failure_returns_502(client):
+    test_client, fake = client
+    fake.fail = True
+
+    assert (
+        test_client.get("/api/host-sandboxes", params={"node_ip": "10.0.0.1"}).status_code
+        == 502
+    )
+
+
 def test_list_requests_filter_by_user(client):
     """user_id on /api/requests returns every request of the user's sandboxes."""
     test_client, fake = client
@@ -1332,3 +1680,706 @@ def test_discovered_sandbox_becomes_accessed_on_first_event(monkeypatch, client)
         for item in test_client.get("/api/sandboxes").json()["items"]
     }
     assert items["fresh"]["accessed"] is True
+
+
+# ---------------------------------------------------------------------------
+# Alertmanager webhook (POST /alerts) and alerts query (GET /api/alerts)
+# ---------------------------------------------------------------------------
+
+def test_record_alertmanager_alerts(client):
+    """A notification's alerts are appended as delivered, normalized."""
+    test_client, fake = client
+
+    response = test_client.post("/alerts", json=ALERTMANAGER_PAYLOAD)
+
+    assert response.status_code == 200
+    assert response.json() == {"accepted": 2}
+    assert len(fake.alerts) == 2
+    first = fake.alerts[0]
+    assert first["fingerprint"] == "abc123"
+    assert first["status"] == "firing"
+    assert first["receiver"] == "audit-webhook"
+    assert first["group_key"] == '{}:{"alertname":"HighMemory"}'
+    assert first["labels"]["alertname"] == "HighMemory"
+    assert first["annotations"]["summary"] == "内存使用过高"
+    assert first["generator_url"] == "http://prometheus:9090/graph"
+    # Nanosecond precision is truncated to whole seconds.
+    assert first["starts_at"].isoformat() == "2026-09-24T08:00:00+00:00"
+    # Alertmanager's zero endsAt ("still firing") becomes NULL.
+    assert first["ends_at"] is None
+    second = fake.alerts[1]
+    assert second["status"] == "resolved"
+    assert second["ends_at"].isoformat() == "2026-09-24T09:00:00+00:00"
+
+
+def test_record_alerts_empty_notification(client):
+    """A notification without alerts is accepted but stores nothing."""
+    test_client, fake = client
+
+    assert test_client.post("/alerts", json={"version": "4", "alerts": []}).json() == {
+        "accepted": 0
+    }
+    # A body without an alerts key defaults to an empty list.
+    assert test_client.post("/alerts", json={"version": "4"}).json() == {"accepted": 0}
+    assert fake.alerts == []
+
+
+def test_record_alerts_invalid_payload(client):
+    test_client, fake = client
+
+    response = test_client.post(
+        "/alerts", json={"alerts": [{"labels": "not-a-dict"}]}
+    )
+
+    assert response.status_code == 422
+    assert fake.alerts == []
+
+
+def test_alerts_truncated_notification_logs_warning(client, caplog):
+    """truncatedAlerts > 0 warns - some alerts never arrived."""
+    test_client, _ = client
+
+    with caplog.at_level("WARNING", logger="audit-webhook"):
+        test_client.post(
+            "/alerts", json={**ALERTMANAGER_PAYLOAD, "truncatedAlerts": 3}
+        )
+
+    assert "truncated 3 alerts" in caplog.text
+
+
+def test_alerts_store_failure_returns_502(client):
+    test_client, fake = client
+    fake.fail = True
+
+    response = test_client.post("/alerts", json=ALERTMANAGER_PAYLOAD)
+
+    assert response.status_code == 502
+
+
+def test_alerts_ingestion_open_without_token(client):
+    """With [alerts] auth_token unset (the fixture default), POST /alerts
+    takes no credentials - the same as event ingestion."""
+    test_client, _ = client
+
+    assert test_client.post("/alerts", json=ALERTMANAGER_PAYLOAD).status_code == 200
+
+
+def test_alerts_ingestion_bearer_token(monkeypatch, client):
+    """With [alerts] auth_token set, POST /alerts requires it as a
+    Bearer token; missing or wrong tokens are rejected."""
+    monkeypatch.setattr(main, "ALERT_AUTH_TOKEN", "tok-1")
+    test_client, fake = client
+
+    # No header -> 401, nothing stored.
+    response = test_client.post("/alerts", json=ALERTMANAGER_PAYLOAD)
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert fake.alerts == []
+
+    # Wrong token -> 401.
+    response = test_client.post(
+        "/alerts",
+        json=ALERTMANAGER_PAYLOAD,
+        headers={"Authorization": "Bearer wrong"},
+    )
+    assert response.status_code == 401
+    assert fake.alerts == []
+
+    # Correct token -> recorded.
+    response = test_client.post(
+        "/alerts",
+        json=ALERTMANAGER_PAYLOAD,
+        headers={"Authorization": "Bearer tok-1"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"accepted": 2}
+    assert len(fake.alerts) == 2
+
+
+def test_alerts_ingestion_ignores_ui_password(monkeypatch, client):
+    """The UI password never applies to alert ingestion - a UI login is a
+    human credential, the alert token is the machine credential."""
+    monkeypatch.setattr(main, "UI_PASSWORD", "secret")
+    test_client, _ = client
+
+    response = test_client.post("/alerts", json=ALERTMANAGER_PAYLOAD)
+
+    assert response.status_code == 200
+
+
+def test_bearer_credentials_are_not_interchangeable(monkeypatch, client):
+    """The two bearer credentials only work on their own surface: the
+    alert token does not unlock query APIs, the UI password does not
+    deliver alerts."""
+    monkeypatch.setattr(main, "UI_PASSWORD", "ui-secret")
+    monkeypatch.setattr(main, "ALERT_AUTH_TOKEN", "alert-secret")
+    test_client, _ = client
+
+    # Alert token on a query API -> 401.
+    assert (
+        test_client.get(
+            "/api/sandboxes/times",
+            headers={"Authorization": "Bearer alert-secret"},
+        ).status_code
+        == 401
+    )
+    # UI password as the alert token -> 401.
+    assert (
+        test_client.post(
+            "/alerts",
+            json=ALERTMANAGER_PAYLOAD,
+            headers={"Authorization": "Bearer ui-secret"},
+        ).status_code
+        == 401
+    )
+    # Each credential works on its own surface.
+    assert (
+        test_client.post(
+            "/alerts",
+            json=ALERTMANAGER_PAYLOAD,
+            headers={"Authorization": "Bearer alert-secret"},
+        ).status_code
+        == 200
+    )
+    assert (
+        test_client.get(
+            "/api/sandboxes/times",
+            headers={"Authorization": "Bearer ui-secret"},
+        ).status_code
+        == 200
+    )
+
+
+def test_list_alerts(client):
+    test_client, _ = client
+    assert test_client.post("/alerts", json=ALERTMANAGER_PAYLOAD).status_code == 200
+
+    response = test_client.get("/api/alerts")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    # Newest delivery first (id DESC): the second alert of the batch.
+    assert data["items"][0]["fingerprint"] == "def456"
+    assert data["items"][0]["status"] == "resolved"
+    assert data["items"][0]["labels"] == {"alertname": "HighCPU", "instance": "pod-2"}
+    assert data["items"][0]["starts_at"] == "2026-09-23T08:00:00Z"
+
+    # status filter
+    data = test_client.get("/api/alerts", params={"status": "firing"}).json()
+    assert data["total"] == 1
+    assert data["items"][0]["fingerprint"] == "abc123"
+
+    # search hits labels (alertname, case-insensitive) and annotations
+    assert (
+        test_client.get("/api/alerts", params={"search": "highcpu"}).json()["total"]
+        == 1
+    )
+    assert (
+        test_client.get("/api/alerts", params={"search": "POD-2"}).json()["total"]
+        == 1
+    )
+    assert (
+        test_client.get("/api/alerts", params={"search": "内存"}).json()["total"] == 1
+    )
+    # ...and fingerprints / receivers
+    assert (
+        test_client.get("/api/alerts", params={"search": "abc123"}).json()["total"]
+        == 1
+    )
+    assert (
+        test_client.get(
+            "/api/alerts", params={"search": "audit-webhook"}
+        ).json()["total"]
+        == 2
+    )
+    # No hit
+    assert test_client.get("/api/alerts", params={"search": "nope"}).json()["total"] == 0
+
+    # pagination
+    data = test_client.get("/api/alerts", params={"limit": 1, "offset": 1}).json()
+    assert data["total"] == 2
+    assert [item["fingerprint"] for item in data["items"]] == ["abc123"]
+
+
+def test_list_alerts_invalid_params(client):
+    test_client, _ = client
+
+    # status must be firing/resolved, limit must be >= 1.
+    assert test_client.get("/api/alerts", params={"status": "silenced"}).status_code == 422
+    assert test_client.get("/api/alerts", params={"limit": 0}).status_code == 422
+
+
+def test_list_alerts_requires_auth(monkeypatch, client):
+    """GET /api/alerts follows the other query APIs: session required when
+    server.ui_password is set."""
+    monkeypatch.setattr(main, "UI_PASSWORD", "secret")
+    test_client, _ = client
+
+    assert test_client.get("/api/alerts").status_code == 401
+
+
+def test_normalize_alert_zero_ends_at_is_none():
+    row = _normalize_alert(
+        {
+            "fingerprint": "f",
+            "status": "firing",
+            "starts_at": "2026-09-24T08:00:00.999Z",
+            "ends_at": "0001-01-01T00:00:00Z",
+        }
+    )
+
+    assert row["ends_at"] is None
+    assert row["starts_at"].isoformat() == "2026-09-24T08:00:00+00:00"
+
+
+def test_normalize_alert_naive_timestamp_assumed_utc():
+    row = _normalize_alert({"starts_at": "2026-09-24T08:00:00"})
+
+    assert row["starts_at"].utcoffset().total_seconds() == 0
+
+
+def test_normalize_alert_defaults():
+    """Missing optional fields degrade to sane defaults, not errors."""
+    row = _normalize_alert({})
+
+    assert row["fingerprint"] == ""
+    assert row["status"] == "firing"
+    assert row["labels"] == {}
+    assert row["annotations"] == {}
+    assert row["starts_at"] is None
+    assert row["ends_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# Memory-alert stale-user lookup (firing host memory alerts -> users on
+# the host not accessed for > [alerts] stale_days days, VIP excluded)
+# ---------------------------------------------------------------------------
+
+def _memory_alert_payload(
+    instance="10.0.0.1:9100", status="firing", alertname="HighMemory", fingerprint="mem-1"
+):
+    """A one-alert Alertmanager notification carrying a host memory alert
+    (``instance`` is the node_exporter-style ``IP:port`` host label)."""
+    labels = {"alertname": alertname, "severity": "warning"}
+    if instance is not None:
+        labels["instance"] = instance
+    return {
+        "version": "4",
+        "receiver": "audit-webhook",
+        "status": status,
+        "alerts": [
+            {
+                "status": status,
+                "labels": labels,
+                "annotations": {"summary": "内存使用过高"},
+                "startsAt": "2026-09-24T08:00:00Z",
+                "endsAt": (
+                    "0001-01-01T00:00:00Z"
+                    if status == "firing"
+                    else "2026-09-25T08:00:00Z"
+                ),
+                "fingerprint": fingerprint,
+            }
+        ],
+    }
+
+
+def _seed(fake, sandbox_id, node_ip, user_id=None, request_time=None, created_at=None):
+    """Put a summary row into the fake store: ``request_time`` records an
+    access, else the sandbox is only discovered (``created_at`` set,
+    never accessed)."""
+    if user_id is not None:
+        fake.user_ids[sandbox_id] = user_id
+    fake.node_ips[sandbox_id] = node_ip
+    if request_time is not None:
+        fake.record([{**EVENT, "sandbox_id": sandbox_id, "request_time": request_time}])
+    else:
+        fake.upsert_discovered_sandboxes(
+            [{"name": sandbox_id, "created_at": created_at, "user_id": user_id}]
+        )
+
+
+def test_memory_alert_lists_stale_users(monkeypatch, client, caplog):
+    """A firing alert whose alertname is configured queries the users on
+    its host (instance label, port stripped): the stale ones come back in
+    the response and the log, the recently active ones do not."""
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", ["HighMemory"])
+    test_client, fake = client
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    stale_since = now - timedelta(days=10)
+    _seed(
+        fake, "sb-stale", "10.0.0.1",
+        user_id="u-stale", request_time=stale_since,
+    )
+    _seed(
+        fake, "sb-recent", "10.0.0.1",
+        user_id="u-recent", request_time=now - timedelta(days=1),
+    )
+
+    with caplog.at_level("WARNING", logger="audit-webhook"):
+        response = test_client.post("/alerts", json=_memory_alert_payload())
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["accepted"] == 1
+    assert fake.stale_queries == [("10.0.0.1", 7, [])]
+    (host_entry,) = data["stale_users"]
+    assert host_entry["host"] == "10.0.0.1"
+    assert host_entry["alertname"] == "HighMemory"
+    (user,) = host_entry["users"]
+    assert user["user_id"] == "u-stale"
+    assert user["sandbox_id"] == "sb-stale"
+    assert user["last_access"] == stale_since.isoformat()
+    assert user["days"] == 10
+    # The stale user and its host show up in the log.
+    assert "u-stale" in caplog.text
+    assert "10.0.0.1" in caplog.text
+
+
+def test_memory_alert_excludes_vip_and_other_hosts(monkeypatch, client):
+    """VIP (whitelisted) users stay out of the list, and so do users
+    whose sandboxes sit on other nodes."""
+    monkeypatch.setattr(main, "WHITELIST_USERS", ["u-vip"])
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", ["HighMemory"])
+    test_client, fake = client
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    _seed(fake, "sb-vip", "10.0.0.1", user_id="u-vip",
+          request_time=now - timedelta(days=10))
+    _seed(fake, "sb-other", "10.0.0.2", user_id="u-other",
+          request_time=now - timedelta(days=10))
+    _seed(fake, "sb-stale", "10.0.0.1", user_id="u-stale",
+          request_time=now - timedelta(days=10))
+
+    response = test_client.post("/alerts", json=_memory_alert_payload())
+
+    assert response.status_code == 200
+    (host_entry,) = response.json()["stale_users"]
+    users = {user["user_id"] for user in host_entry["users"]}
+    assert users == {"u-stale"}
+    # The whitelist reached the store query.
+    assert fake.stale_queries == [("10.0.0.1", 7, ["u-vip"])]
+
+
+def test_memory_alert_unconfigured_alertname_skips_lookup(client):
+    """Alerts whose alertname is not in [alerts] memory_alert_names do
+    not trigger a lookup; the response keeps its old shape."""
+    test_client, fake = client  # MEMORY_ALERT_NAMES = [] from the fixture
+
+    response = test_client.post("/alerts", json=_memory_alert_payload())
+
+    assert response.status_code == 200
+    assert response.json() == {"accepted": 1}
+    assert fake.stale_queries == []
+
+
+def test_resolved_memory_alert_skips_lookup(monkeypatch, client):
+    """Only firing memory alerts trigger the lookup - a resolved alert
+    needs no action."""
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", ["HighMemory"])
+    test_client, fake = client
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    _seed(fake, "sb-stale", "10.0.0.1", user_id="u-stale",
+          request_time=now - timedelta(days=10))
+
+    response = test_client.post(
+        "/alerts", json=_memory_alert_payload(status="resolved")
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"accepted": 1}
+    assert fake.stale_queries == []
+
+
+def test_memory_alert_never_accessed_counts_from_creation(monkeypatch, client):
+    """A never-accessed sandbox is stale since its creation: an old one
+    is listed (last_access = created_at), a fresh one is not."""
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", ["HighMemory"])
+    test_client, fake = client
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    old_created = now - timedelta(days=10)
+    _seed(fake, "sb-old", "10.0.0.1", user_id="u-old", created_at=old_created)
+    _seed(fake, "sb-new", "10.0.0.1", user_id="u-new",
+          created_at=now - timedelta(days=1))
+
+    response = test_client.post("/alerts", json=_memory_alert_payload())
+
+    assert response.status_code == 200
+    (host_entry,) = response.json()["stale_users"]
+    (user,) = host_entry["users"]
+    assert user["user_id"] == "u-old"
+    assert user["last_access"] == old_created.isoformat()
+
+
+def test_memory_alert_falls_back_to_deleted_history(monkeypatch, client):
+    """A never-accessed current sandbox falls back to the user's deleted
+    history (summary-page semantics): recent history keeps the user out,
+    old history lists them."""
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", ["HighMemory"])
+    test_client, fake = client
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    # u-1's current sandbox was never accessed; their removed sandbox was
+    # last requested 3 days ago -> still active, not stale.
+    _seed(fake, "sb-cur-1", "10.0.0.1", user_id="u-1",
+          created_at=now - timedelta(days=10))
+    _seed(fake, "sb-old-1", "10.0.0.9", user_id="u-1",
+          request_time=now - timedelta(days=3))
+    fake.sync_deleted_flags(["sb-cur-1"])
+    # u-2: same, but the last history request is 10 days old -> stale.
+    _seed(fake, "sb-cur-2", "10.0.0.1", user_id="u-2",
+          created_at=now - timedelta(days=10))
+    _seed(fake, "sb-old-2", "10.0.0.9", user_id="u-2",
+          request_time=now - timedelta(days=10))
+    fake.sync_deleted_flags(["sb-cur-1", "sb-cur-2"])
+
+    response = test_client.post("/alerts", json=_memory_alert_payload())
+
+    assert response.status_code == 200
+    (host_entry,) = response.json()["stale_users"]
+    users = {user["user_id"] for user in host_entry["users"]}
+    assert users == {"u-2"}
+
+
+def test_memory_alert_without_instance_label_skipped(monkeypatch, client, caplog):
+    """A memory alert without an instance label names no host - it is
+    skipped with a warning but still stored."""
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", ["HighMemory"])
+    test_client, fake = client
+
+    with caplog.at_level("WARNING", logger="audit-webhook"):
+        response = test_client.post(
+            "/alerts", json=_memory_alert_payload(instance=None)
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"accepted": 1}
+    assert fake.stale_queries == []
+    assert "no instance label" in caplog.text
+    assert len(fake.alerts) == 1
+
+
+def test_memory_alert_lookup_failure_keeps_ingestion(monkeypatch, client, caplog):
+    """A failed stale-user lookup is logged but never fails the
+    delivery - Alertmanager must not retry and duplicate the alerts."""
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", ["HighMemory"])
+    test_client, fake = client
+    fake.stale_fail = True
+
+    with caplog.at_level("ERROR", logger="audit-webhook"):
+        response = test_client.post("/alerts", json=_memory_alert_payload())
+
+    assert response.status_code == 200
+    assert response.json() == {"accepted": 1}
+    assert len(fake.alerts) == 1
+    assert "failed to look up stale users" in caplog.text
+
+
+def test_memory_alert_dedupes_hosts(monkeypatch, client):
+    """Two firing memory alerts naming the same host (with and without a
+    port) trigger exactly one lookup."""
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", ["HighMemory"])
+    test_client, fake = client
+    payload = _memory_alert_payload(instance="10.0.0.1:9100", fingerprint="mem-1")
+    payload["alerts"].append(
+        {
+            "status": "firing",
+            "labels": {"alertname": "HighMemory", "instance": "10.0.0.1"},
+            "annotations": {},
+            "startsAt": "2026-09-24T08:00:00Z",
+            "endsAt": "0001-01-01T00:00:00Z",
+            "fingerprint": "mem-2",
+        }
+    )
+
+    response = test_client.post("/alerts", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] == 2
+    assert fake.stale_queries == [("10.0.0.1", 7, [])]
+
+
+def test_memory_alert_skips_sandboxes_without_user_id(monkeypatch, client):
+    """Sandboxes the sync could not resolve a user id for have no user to
+    list - they are skipped instead of crashing the lookup."""
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", ["HighMemory"])
+    test_client, fake = client
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    _seed(fake, "sb-bare", "10.0.0.1", request_time=now - timedelta(days=10))
+
+    response = test_client.post("/alerts", json=_memory_alert_payload())
+
+    assert response.status_code == 200
+    # No listable user at all -> no stale_users key in the response.
+    assert response.json() == {"accepted": 1}
+    assert fake.stale_queries == [("10.0.0.1", 7, [])]
+
+
+# ---------------------------------------------------------------------------
+# Auto-stop on memory alerts (firing host memory alerts -> POST the first
+# [alerts] stop_limit stale users' user ids to [alerts] stop_url)
+# ---------------------------------------------------------------------------
+
+class RecordedStop:
+    """Captures the stop-call requests made by main._stop_sandboxes."""
+
+    def __init__(self, statuses=()):
+        self.calls = []  # (url, body dict)
+        self._statuses = iter(statuses)
+
+    def __call__(self, url, body):
+        self.calls.append((url, body))
+        status = next(self._statuses, 200)
+        if isinstance(status, Exception):
+            raise status
+        return status
+
+
+def test_memory_alert_stop_sandboxes_posts_first_users(monkeypatch, client):
+    """With [alerts] stop_sandboxes on, a firing memory alert POSTs the
+    first stop_limit stale users' user ids (oldest first) to stop_url
+    with the configured slug; the response counters report the outcome."""
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", ["HighMemory"])
+    monkeypatch.setattr(main, "STOP_SANDBOXES", True)
+    monkeypatch.setattr(main, "STOP_URL", "http://stop:8000/claw-catalog/stop")
+    monkeypatch.setattr(main, "STOP_SLUG", "v20260427")
+    monkeypatch.setattr(main, "STOP_LIMIT", 2)
+    test_client, fake = client
+    now = datetime.now(timezone.utc)
+    # Three stale users on the host (sb ids ordered by staleness).
+    _seed(fake, "sb-oldest", "10.0.0.1", user_id="u-1",
+          request_time=now - timedelta(days=30))
+    _seed(fake, "sb-mid", "10.0.0.1", user_id="u-2",
+          request_time=now - timedelta(days=20))
+    _seed(fake, "sb-late", "10.0.0.1", user_id="u-3",
+          request_time=now - timedelta(days=10))
+    stop = RecordedStop()
+    monkeypatch.setattr(main, "_stop_request", stop)
+
+    response = test_client.post("/alerts", json=_memory_alert_payload())
+
+    assert response.status_code == 200
+    # Only the first stop_limit users, most stale first.
+    assert stop.calls == [
+        (
+            "http://stop:8000/claw-catalog/stop",
+            {"external_user_id": "u-1", "slug": "v20260427"},
+        ),
+        (
+            "http://stop:8000/claw-catalog/stop",
+            {"external_user_id": "u-2", "slug": "v20260427"},
+        ),
+    ]
+    host_entry = response.json()["stale_users"][0]
+    assert host_entry["stopped"] == 2
+    assert host_entry["failed"] == 0
+
+
+def test_memory_alert_stop_failure_continues(monkeypatch, client):
+    """A failing stop call is logged and counted; the remaining stops
+    still run and the ingestion keeps succeeding."""
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", ["HighMemory"])
+    monkeypatch.setattr(main, "STOP_SANDBOXES", True)
+    monkeypatch.setattr(main, "STOP_URL", "http://stop:8000/claw-catalog/stop")
+    monkeypatch.setattr(main, "STOP_SLUG", "v20260427")
+    monkeypatch.setattr(main, "STOP_LIMIT", 10)
+    test_client, fake = client
+    now = datetime.now(timezone.utc)
+    _seed(fake, "sb-a", "10.0.0.1", user_id="u-1",
+          request_time=now - timedelta(days=30))
+    _seed(fake, "sb-b", "10.0.0.1", user_id="u-2",
+          request_time=now - timedelta(days=20))
+    stop = RecordedStop(statuses=[500, 200])
+    monkeypatch.setattr(main, "_stop_request", stop)
+
+    response = test_client.post("/alerts", json=_memory_alert_payload())
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] == 1
+    assert len(stop.calls) == 2
+    host_entry = response.json()["stale_users"][0]
+    assert host_entry["stopped"] == 1
+    assert host_entry["failed"] == 1
+
+
+def test_memory_alert_stop_disabled_by_default(monkeypatch, client):
+    """Without [alerts] stop_sandboxes, no stop request is made."""
+    test_client, fake = client
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", ["HighMemory"])
+    monkeypatch.setattr(main, "STOP_SANDBOXES", False)
+    now = datetime.now(timezone.utc)
+    _seed(fake, "sb-stale", "10.0.0.1", user_id="u-stale",
+          request_time=now - timedelta(days=30))
+    stop = RecordedStop()
+    monkeypatch.setattr(main, "_stop_request", stop)
+
+    response = test_client.post("/alerts", json=_memory_alert_payload())
+
+    assert response.status_code == 200
+    assert stop.calls == []
+    host_entry = response.json()["stale_users"][0]
+    assert host_entry["stopped"] == 0
+    assert host_entry["failed"] == 0
+
+
+def test_memory_alert_no_stale_users_no_stops(monkeypatch, client):
+    """A memory alert whose host has no stale users makes no stop calls."""
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", ["HighMemory"])
+    monkeypatch.setattr(main, "STOP_SANDBOXES", True)
+    test_client, fake = client
+    now = datetime.now(timezone.utc)
+    _seed(fake, "sb-recent", "10.0.0.1", user_id="u-recent",
+          request_time=now - timedelta(days=1))
+    stop = RecordedStop()
+    monkeypatch.setattr(main, "_stop_request", stop)
+
+    response = test_client.post("/alerts", json=_memory_alert_payload())
+
+    assert response.status_code == 200
+    assert stop.calls == []
+    # Nothing stale -> no stale_users section at all.
+    assert response.json() == {"accepted": 1}
+
+
+def test_memory_alert_resolved_status_no_stops(monkeypatch, client):
+    """A resolved memory alert triggers neither the lookup nor stops."""
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", ["HighMemory"])
+    monkeypatch.setattr(main, "STOP_SANDBOXES", True)
+    test_client, fake = client
+    stop = RecordedStop()
+    monkeypatch.setattr(main, "_stop_request", stop)
+
+    response = test_client.post(
+        "/alerts", json=_memory_alert_payload(status="resolved")
+    )
+
+    assert response.status_code == 200
+    assert stop.calls == []
+    assert fake.stale_queries == []
+
+
+def test_memory_alert_stop_network_error_continues(monkeypatch, client, caplog):
+    """A stop call raising a network error counts as failed; the rest of
+    the stops and the ingestion itself keep going."""
+    monkeypatch.setattr(main, "MEMORY_ALERT_NAMES", ["HighMemory"])
+    monkeypatch.setattr(main, "STOP_SANDBOXES", True)
+    monkeypatch.setattr(main, "STOP_URL", "http://stop:8000/claw-catalog/stop")
+    monkeypatch.setattr(main, "STOP_SLUG", "v20260427")
+    monkeypatch.setattr(main, "STOP_LIMIT", 10)
+    test_client, fake = client
+    now = datetime.now(timezone.utc)
+    _seed(fake, "sb-a", "10.0.0.1", user_id="u-1",
+          request_time=now - timedelta(days=30))
+    _seed(fake, "sb-b", "10.0.0.1", user_id="u-2",
+          request_time=now - timedelta(days=20))
+    stop = RecordedStop(statuses=[HTTPError(None, None, "connection refused", None, None), 200])
+    monkeypatch.setattr(main, "_stop_request", stop)
+
+    with caplog.at_level("WARNING", logger="audit-webhook"):
+        response = test_client.post("/alerts", json=_memory_alert_payload())
+
+    assert response.status_code == 200
+    assert len(stop.calls) == 2
+    host_entry = response.json()["stale_users"][0]
+    assert host_entry["stopped"] == 1
+    assert host_entry["failed"] == 1
+    assert "stop request failed" in caplog.text

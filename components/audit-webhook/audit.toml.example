@@ -50,5 +50,45 @@ excluded_uri_suffixes = ["ping"]
 users = []
 # users = ["7680071018521559040"]
 
+[alerts]
+# Bearer token for the Alertmanager webhook (POST /alerts). When
+# non-empty, deliveries must carry it as an Authorization: Bearer <token>
+# header - configure the same token in the Alertmanager receiver:
+#
+#   webhook_configs:
+#     - url: http://audit-webhook:8080/alerts
+#       http_config:
+#         authorization:
+#           type: Bearer
+#           credentials: "<this token>"
+#
+# Empty = no authentication (open like POST /events). Independent of
+# server.ui_password.
+auth_token = ""
+
+# Host memory alerts. A firing alert whose alertname is listed here
+# triggers a stale-user lookup for its host: the alert's "instance"
+# label (node_exporter style "IP:port" - the port is stripped)
+# identifies the host, and the users whose sandboxes on that host were
+# not accessed for more than stale_days days (VIP/whitelisted users
+# excluded) are logged as a warning and returned in the POST /alerts
+# response body as "stale_users" (for downstream automation). Empty
+# list = the lookup is off.
+memory_alert_names = []
+# memory_alert_names = ["HighMemory"]
+# Stale-user threshold in days for the memory-alert lookup above.
+stale_days = 7
+
+# Auto-stop (自动停止): when enabled, a firing memory alert whose lookup
+# found stale users also stops the first stop_limit (most stale) users'
+# sandbox services by POSTing {"external_user_id": <user_id>, "slug":
+# stop_slug} to stop_url (the claw-catalog stop endpoint). Off by
+# default - enable explicitly after a successful stale-user dry run.
+stop_sandboxes = false
+stop_url = "http://10.68.205.224:8000/claw-catalog/stop"
+stop_slug = "v20260427"
+# Max users stopped per alerting host.
+stop_limit = 10
+
 [log]
 level = "INFO"

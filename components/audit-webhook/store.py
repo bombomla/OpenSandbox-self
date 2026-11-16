@@ -25,6 +25,11 @@ Two tables are maintained:
   Sandboxes discovered in the cluster before any request arrived are
   inserted with ``accessed = FALSE`` (request fields NULL) so the UI can
   tell them apart from accessed ones.
+
+Alerts from Alertmanager (``POST /alerts``) go to a third table:
+
+- ``alertmanager_alert``: one row per delivered alert, kept append-only
+  (firing and resolved deliveries both stay queryable).
 """
 
 import logging
@@ -32,6 +37,7 @@ from datetime import datetime, timezone
 
 from psycopg import sql
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 logger = logging.getLogger(__name__)
@@ -93,6 +99,29 @@ ALTER TABLE sandbox_access_latest
     ALTER COLUMN method DROP NOT NULL,
     ALTER COLUMN target DROP NOT NULL,
     ALTER COLUMN request_time DROP NOT NULL
+"""
+
+# One row per alert delivered by an Alertmanager webhook notification.
+# Append-only: both the firing and the later resolved delivery of the
+# same fingerprint stay in the table (distinguished by ``status``); the
+# envelope fields (``receiver``/``group_key``) are repeated on each row
+# so every row is self-contained.
+_CREATE_ALERT_TABLE = """
+CREATE TABLE IF NOT EXISTS alertmanager_alert (
+    id            BIGSERIAL PRIMARY KEY,
+    fingerprint   TEXT        NOT NULL DEFAULT '',
+    status        TEXT        NOT NULL,
+    receiver      TEXT,
+    group_key     TEXT,
+    labels        JSONB       NOT NULL DEFAULT '{}',
+    annotations   JSONB       NOT NULL DEFAULT '{}',
+    starts_at     TIMESTAMPTZ,
+    ends_at       TIMESTAMPTZ,
+    generator_url TEXT,
+    received_at   TIMESTAMPTZ NOT NULL DEFAULT date_trunc('second', now())
+);
+CREATE INDEX IF NOT EXISTS idx_alertmanager_alert_start
+    ON alertmanager_alert (starts_at DESC);
 """
 
 # Truncate timestamps to whole seconds on write.
@@ -241,6 +270,43 @@ _LATEST_ORDERS = {
     "-user_type": "(uid = ANY(%(whitelist)s)) DESC, request_time DESC NULLS LAST",
 }
 
+# Stale-user lookup for host memory alerts. The member rows are the
+# live (non-deleted) sandboxes on the alerting node with a resolved user
+# id; VIP users (``exclude_users``, the whitelist) drop out there. The
+# group's effective last access chains the current sandbox's latest
+# request -> the user's latest request across their deleted sandboxes
+# (the summary fallback, via all_rows) -> the sandbox's creation time
+# (never-accessed rows are stale since creation). HAVING cannot
+# reference SELECT aliases, so the expression is spelled out twice.
+_STALE_LAST_ACCESS = (
+    "COALESCE(max(request_time), max(history_request_time), min(created_at))"
+)
+
+_LIST_STALE_USERS = (
+    "WITH all_rows AS ("
+    + _LATEST_ALL_ROWS
+    + """),
+member AS (SELECT * FROM all_rows
+           WHERE NOT deleted
+             AND node_ip = %(node_ip)s
+             AND user_id IS NOT NULL
+             AND user_id <> ALL(%(exclude_users)s))
+SELECT max(user_id)    AS user_id,
+       max(sandbox_id) AS sandbox_id,
+       """
+    + f"{_STALE_LAST_ACCESS} AS last_access\n"
+    + """FROM member
+GROUP BY uid
+HAVING ("""
+    + _STALE_LAST_ACCESS
+    + """ IS NULL
+     OR """
+    + _STALE_LAST_ACCESS
+    + """ < now() - make_interval(days => %(stale_days)s))
+ORDER BY last_access ASC NULLS FIRST
+"""
+)
+
 # Flat per-sandbox listing for usage/lifetime reports: one row per
 # sandbox id with its user id, creation time and latest request time.
 # Sandboxes never accessed (request_time NULL) report their creation
@@ -265,6 +331,27 @@ _COUNT_SANDBOX_TIMES = """
 SELECT count(*) AS total FROM sandbox_access_latest {where}
 """
 
+# Per-host sandbox listing: one row per live sandbox on the given node,
+# carrying its user id, creation time and latest request time (NULL when
+# never accessed). ``{and_stale}`` optionally keeps only sandboxes whose
+# effective last-active time - the latest request, or the creation time
+# when the sandbox was never accessed - is older than ``stale_days`` days;
+# a row without any timestamp at all counts as stale. Rows are ordered
+# least-recently-active first so the most idle sandboxes surface at the
+# top. Deleted rows are hidden (only live sandboxes sit on a host); the
+# audit history of removed sandboxes stays on /api/requests.
+_LIST_HOST_SANDBOXES = """
+SELECT sandbox_id,
+       user_id,
+       created_at,
+       request_time
+FROM sandbox_access_latest
+WHERE NOT deleted
+  AND node_ip = %(node_ip)s
+  {and_stale}
+ORDER BY COALESCE(request_time, created_at) ASC NULLS FIRST
+"""
+
 _LIST_DETAILS = """
 SELECT log.id, log.sandbox_id, log.uri, log.method, log.target, log.request_time, log.received_at,
        latest.user_id, latest.deleted AS sandbox_deleted,
@@ -282,6 +369,33 @@ FROM sandbox_access_log AS log
 WHERE {where}
 """
 
+_INSERT_ALERT = """
+INSERT INTO alertmanager_alert
+    (fingerprint, status, receiver, group_key, labels, annotations,
+     starts_at, ends_at, generator_url, received_at)
+VALUES (%(fingerprint)s, %(status)s, %(receiver)s, %(group_key)s,
+        %(labels)s, %(annotations)s, %(starts_at)s, %(ends_at)s,
+        %(generator_url)s, {now})
+""".format(now=_TRUNCATED_NOW)
+
+# Newest delivery first (id is a serial, so it follows arrival order).
+# The ``search`` pattern matches the alert text broadly - labels and
+# annotations are matched as their JSON text, so alertname, instance,
+# severity, summary etc. all hit with one field.
+_LIST_ALERTS = """
+SELECT id, fingerprint, status, receiver, group_key, labels, annotations,
+       starts_at, ends_at, generator_url, received_at,
+       count(*) OVER () AS __total
+FROM alertmanager_alert
+{where}
+ORDER BY id DESC
+LIMIT %(limit)s OFFSET %(offset)s
+"""
+
+_COUNT_ALERTS = """
+SELECT count(*) AS total FROM alertmanager_alert {where}
+"""
+
 
 class AuditStore:
     """Writes audit events to PostgreSQL using a connection pool."""
@@ -296,6 +410,7 @@ class AuditStore:
                 cur.execute(sql.SQL(_CREATE_DETAIL_TABLE))
                 cur.execute(sql.SQL(_CREATE_SUMMARY_TABLE))
                 cur.execute(sql.SQL(_ALTER_SUMMARY_MIGRATIONS))
+                cur.execute(sql.SQL(_CREATE_ALERT_TABLE))
         logger.info("audit schema initialized")
 
     def record(self, events: list[dict]) -> int:
@@ -314,6 +429,27 @@ class AuditStore:
                     cur.execute(_INSERT_DETAIL, params)
                     cur.execute(_UPSERT_SUMMARY, params)
         return len(events)
+
+    def record_alerts(self, alerts: list[dict]) -> int:
+        """Persist Alertmanager alerts in a single transaction, one row
+        per delivered alert (append-only; a resolved delivery adds a row
+        rather than updating the firing one). Returns the number of
+        recorded alerts."""
+        if not alerts:
+            return 0
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                for alert in alerts:
+                    params = _normalize_alert(alert)
+                    # psycopg does not adapt dicts on its own - wrap for jsonb.
+                    cur.execute(
+                        _INSERT_ALERT,
+                        params | {
+                            "labels": Jsonb(params["labels"]),
+                            "annotations": Jsonb(params["annotations"]),
+                        },
+                    )
+        return len(alerts)
 
     def list_latest(
         self,
@@ -469,6 +605,84 @@ class AuditStore:
                     total = cur.fetchone()["total"]
         return {"total": total, "items": [_jsonify(row) for row in rows]}
 
+    def list_host_sandboxes(
+        self,
+        node_ip: str,
+        stale_days: int | None = None,
+    ) -> dict:
+        """List the live sandboxes on ``node_ip``, one row each:
+        ``user_id``, ``sandbox_id``, ``created_at`` and ``request_time``
+        (the latest request time; NULL when the sandbox was never
+        accessed), least-recently-active first.
+
+        ``stale_days`` (optional) keeps only sandboxes whose effective
+        last-active time - the latest request time, or the creation time
+        when the sandbox was never accessed - is older than that many
+        days; a sandbox with no timestamp at all (neither request nor
+        creation) is treated as stale. Deleted sandboxes are hidden: only
+        live sandboxes sit on a host. The audit history of removed
+        sandboxes stays on ``list_details``.
+
+        ``node_ip`` is the bare host IP (no ``:port``); strip the port
+        before calling (the API route does so for Alertmanager-style
+        ``instance`` labels).
+        """
+        params: dict = {"node_ip": node_ip}
+        and_stale = ""
+        if stale_days is not None:
+            and_stale = (
+                " AND (COALESCE(request_time, created_at) IS NULL"
+                " OR COALESCE(request_time, created_at)"
+                " < now() - make_interval(days => %(stale_days)s))"
+            )
+            params["stale_days"] = stale_days
+        with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            with conn.cursor() as cur:
+                cur.execute(
+                    _LIST_HOST_SANDBOXES.format(and_stale=and_stale),
+                    params,
+                )
+                rows = cur.fetchall()
+        items = [_jsonify(row) for row in rows]
+        return {"total": len(items), "items": items}
+
+    def list_stale_users(
+        self,
+        node_ip: str,
+        stale_days: int,
+        exclude_users: list[str] | None = None,
+    ) -> list[dict]:
+        """Users with a live sandbox on ``node_ip`` not accessed for more
+        than ``stale_days`` days.
+
+        One row per user: ``user_id``, their current (non-deleted)
+        ``sandbox_id`` on the node and the group's effective
+        ``last_access`` - the sandbox's latest request, or - when it was
+        never accessed - the user's latest request across their
+        already-deleted sandboxes (the summary fallback), or the
+        sandbox's creation time. A group without any timestamp (nothing
+        ever recorded) counts as stale. ``exclude_users`` (the whitelist)
+        drops VIP users. Most stale first; never-timestamped rows first.
+
+        Used by the ``POST /alerts`` memory-alert lookup: the alert's
+        ``instance`` label (``IP:port``) identifies the host; the result
+        is logged and returned in the response for downstream automation.
+        """
+        with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            with conn.cursor() as cur:
+                cur.execute(
+                    _LIST_STALE_USERS,
+                    {
+                        "node_ip": node_ip,
+                        "stale_days": stale_days,
+                        "exclude_users": exclude_users or [],
+                    },
+                )
+                rows = cur.fetchall()
+        return [_jsonify(row) for row in rows]
+
     def list_details(
         self,
         sandbox_id: str | None = None,
@@ -516,6 +730,51 @@ class AuditStore:
                     # Past the last page: the window count returned nothing,
                     # fall back to a separate COUNT for the true total.
                     cur.execute(_COUNT_DETAILS.format(where=where), params)
+                    total = cur.fetchone()["total"]
+        return {"total": total, "items": [_jsonify(row) for row in rows]}
+
+    def list_alerts(
+        self,
+        status: str | None = None,
+        search: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        """List recorded alerts, newest delivery first.
+
+        ``status`` filters by the alert state (``firing``/``resolved``);
+        ``search`` fuzzy-matches fingerprints, receivers, group keys and
+        the JSON text of labels/annotations (so alertname, instance,
+        severity, summary etc. all hit with one field; ``%``/``_`` in
+        the input are matched literally).
+        """
+        conditions, params = [], {"limit": limit, "offset": offset}
+        if status:
+            conditions.append("status = %(status)s")
+            params["status"] = status
+        if search:
+            params["pattern"] = f"%{_like_escape(search)}%"
+            conditions.append(
+                "(fingerprint ILIKE %(pattern)s ESCAPE '\\'"
+                " OR receiver ILIKE %(pattern)s ESCAPE '\\'"
+                " OR group_key ILIKE %(pattern)s ESCAPE '\\'"
+                " OR labels::text ILIKE %(pattern)s ESCAPE '\\'"
+                " OR annotations::text ILIKE %(pattern)s ESCAPE '\\')"
+            )
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            with conn.cursor() as cur:
+                cur.execute(_LIST_ALERTS.format(where=where), params)
+                rows = cur.fetchall()
+                if rows:
+                    total = rows[0]["__total"]
+                    rows = [_drop_total(row) for row in rows]
+                else:
+                    # Past the last page: the window count returned nothing,
+                    # fall back to a separate COUNT for the true total.
+                    cur.execute(_COUNT_ALERTS.format(where=where), params)
                     total = cur.fetchone()["total"]
         return {"total": total, "items": [_jsonify(row) for row in rows]}
 
@@ -655,6 +914,40 @@ def _normalize(event: dict) -> dict:
         "method": event["method"],
         "target": event["target"],
         "request_time": request_time,
+    }
+
+
+# Alertmanager's sentinel for "no end time yet" on firing alerts.
+_ZERO_TIME = datetime(1, 1, 1, tzinfo=timezone.utc)
+
+
+def _alert_time(value) -> datetime | None:
+    """Coerce an alert timestamp to a DB parameter: naive values are
+    assumed to be UTC, values are truncated to whole seconds, and
+    Alertmanager's zero time (``0001-01-01T00:00:00Z``) becomes NULL."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    value = value.replace(microsecond=0)
+    return value if value > _ZERO_TIME else None
+
+
+def _normalize_alert(alert: dict) -> dict:
+    """Coerce one delivered alert to DB row parameters (see
+    ``AlertmanagerAlert`` in main.py for the input shape)."""
+    return {
+        "fingerprint": alert.get("fingerprint") or "",
+        "status": alert.get("status") or "firing",
+        "receiver": alert.get("receiver"),
+        "group_key": alert.get("group_key"),
+        "labels": dict(alert.get("labels") or {}),
+        "annotations": dict(alert.get("annotations") or {}),
+        "starts_at": _alert_time(alert.get("starts_at")),
+        "ends_at": _alert_time(alert.get("ends_at")),
+        "generator_url": alert.get("generator_url"),
     }
 
 

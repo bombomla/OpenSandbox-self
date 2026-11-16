@@ -24,17 +24,32 @@ Web UI (password protected when ``server.ui_password`` is set):
 - ``GET /details``   - request details page, filterable by sandbox id
 - ``GET /login``     - login page
 
+Alertmanager webhooks (``POST /alerts``): each notification's alerts are
+appended to the ``alertmanager_alert`` table (queryable via
+``GET /api/alerts``). A firing alert whose alertname is listed in
+``[alerts] memory_alert_names`` also triggers a stale-user lookup for
+its host (the ``instance`` label, ``IP:port``): users whose sandboxes
+on that host were not accessed for more than ``[alerts] stale_days``
+days (VIP/whitelisted users excluded) are logged and returned in the
+response. When ``[alerts] stop_sandboxes`` is enabled, the first
+``[alerts] stop_limit`` (most stale) users' sandbox services are in
+addition stopped by POSTing to ``[alerts] stop_url`` (counted in the
+response as ``stopped`` / ``failed``). Delivery auth is a Bearer token
+from ``[alerts] auth_token`` - required when set, open when empty.
+
 Run:
     cp audit.toml.example audit.toml   # then edit settings
     python main.py
 """
 
 import asyncio
+import json
 import logging
 import secrets
 import sys
+import urllib.request
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Literal, Union
 
@@ -43,10 +58,10 @@ from typing import Annotated, Literal, Union
 sys.path.insert(0, str(Path(__file__).resolve().parent / "utils"))
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from psycopg_pool import ConnectionPool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 import k8s
 from auth import (
@@ -99,6 +114,34 @@ K8S_SYNC_INTERVAL = _config["k8s_sync_interval"]
 # audited alike.
 WHITELIST_USERS = _config["whitelist_users"]
 
+# Bearer token for the Alertmanager webhook (``[alerts] auth_token`` in
+# audit.toml). When non-empty, POST /alerts requires
+# ``Authorization: Bearer <token>`` - Alertmanager sends it via the
+# receiver's http_config. When empty, the endpoint is open like
+# POST /events (the token is a machine credential, separate from the
+# UI password).
+ALERT_AUTH_TOKEN = _config["alert_auth_token"]
+
+# Memory-alert stale-user lookup (``[alerts] memory_alert_names``). A
+# firing alert whose alertname is listed here looks up the users whose
+# sandboxes on the alert's host (the ``instance`` label, ``IP:port`` -
+# the port is stripped) were not accessed for more than ``stale_days``
+# days (VIP/whitelisted users excluded). The list is logged and returned
+# in the POST /alerts response for downstream automation. Empty list =
+# the lookup is off.
+MEMORY_ALERT_NAMES = _config["memory_alert_names"]
+STALE_DAYS = _config["stale_days"]
+
+# Auto-stop on memory alerts (``[alerts] stop_sandboxes`` etc.). When
+# enabled, a firing memory alert whose stale-user lookup found users
+# POSTs ``{"external_user_id": <user_id>, "slug": stop_slug}`` to
+# ``stop_url`` for the first ``stop_limit`` (most stale) users - the
+# claw-catalog stop endpoint tears down their sandbox service.
+STOP_SANDBOXES = _config["stop_sandboxes"]
+STOP_URL = _config["stop_url"]
+STOP_SLUG = _config["stop_slug"]
+STOP_LIMIT = _config["stop_limit"]
+
 _SESSION_TTL = 7 * 24 * 3600  # 7 days, in seconds
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -114,6 +157,65 @@ class AuditEvent(BaseModel):
 
 class AuditEventAccepted(BaseModel):
     accepted: int
+
+
+# Matches the Alertmanager webhook notification payload (version 4;
+# camelCase keys as sent by Alertmanager, snake_case accepted too via
+# populate_by_name). Unknown fields are ignored so new Alertmanager
+# versions do not break ingestion.
+class AlertmanagerAlert(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    status: str = "firing"
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+    starts_at: datetime | None = Field(default=None, alias="startsAt")
+    ends_at: datetime | None = Field(default=None, alias="endsAt")
+    generator_url: str | None = Field(default=None, alias="generatorURL")
+    fingerprint: str = ""
+
+
+class AlertmanagerPayload(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    version: str | None = None
+    group_key: str | None = Field(default=None, alias="groupKey")
+    truncated_alerts: int = Field(default=0, alias="truncatedAlerts")
+    status: str | None = None
+    receiver: str | None = None
+    group_labels: dict[str, str] = Field(default_factory=dict, alias="groupLabels")
+    common_labels: dict[str, str] = Field(default_factory=dict, alias="commonLabels")
+    common_annotations: dict[str, str] = Field(default_factory=dict, alias="commonAnnotations")
+    external_url: str | None = Field(default=None, alias="externalURL")
+    alerts: list[AlertmanagerAlert] = Field(default_factory=list)
+
+
+# A stale user flagged by a host memory alert: their user id, their
+# current sandbox on the host, the group's effective last access time
+# (see AuditStore.list_stale_users) and whole days since then.
+class StaleUser(BaseModel):
+    user_id: str
+    sandbox_id: str
+    last_access: str | None = None
+    days: int | None = None
+
+
+# The lookup result for one alerting host (host IP, the alertname that
+# flagged it, the stale users found there) plus the auto-stop outcome:
+# how many of the first stop_limit users' services the stop endpoint
+# reported stopped, and how many calls failed (stopped + failed = the
+# number of stop calls made; 0 when auto-stop is off).
+class HostStaleUsers(BaseModel):
+    host: str
+    alertname: str
+    users: list[StaleUser]
+    stopped: int = 0
+    failed: int = 0
+
+
+class AlertsAccepted(BaseModel):
+    accepted: int
+    stale_users: list[HostStaleUsers] | None = None
 
 
 @asynccontextmanager
@@ -184,43 +286,83 @@ app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 
 # ---------------------------------------------------------------------------
-# Authentication
+# Authentication (unified)
+#
+# One dependency per protection level. Every protected endpoint declares
+# exactly one of them on its route (``dependencies=[Depends(...)]``) -
+# new endpoints must use these instead of hand-rolled checks:
+#
+#   require_page_session          UI pages: session cookie; a missing
+#                                 session 303-redirects to /login
+#   require_session               UI query APIs: session cookie; 401
+#   require_session_or_password   query APIs that also serve programmatic
+#                                 callers: session cookie OR
+#                                 Authorization: Bearer <ui_password>
+#   require_alert_token           machine ingestion (Alertmanager
+#                                 POST /alerts): open unless
+#                                 [alerts] auth_token is set, then
+#                                 Authorization: Bearer <that token>
+#
+# Each check is a no-op while its credential is unset (server.ui_password
+# / [alerts] auth_token empty) - auth is strictly opt-in per surface.
+# Event ingestion (POST /events, POST /) stays open by design: the
+# ingress delivers without credentials.
 # ---------------------------------------------------------------------------
 
-def _valid_session(token: str | None) -> bool:
-    return valid_session(UI_PASSWORD, token)
+
+def _session_ok(request: Request) -> bool:
+    """A valid UI session cookie for the configured password."""
+    return valid_session(UI_PASSWORD, session_token_from(request.cookies))
 
 
-def _session_token(request: Request) -> str | None:
-    return session_token_from(request.cookies)
+def _bearer_ok(request: Request, token: str) -> bool:
+    """An ``Authorization: Bearer <token>`` header carrying exactly
+    ``token`` (constant-time comparison)."""
+    scheme, _, value = request.headers.get("authorization", "").partition(" ")
+    return scheme.lower() == "bearer" and secrets.compare_digest(
+        value.encode(), token.encode()
+    )
 
 
-def _login_redirect() -> RedirectResponse:
-    return RedirectResponse("/login", status_code=303)
+def require_page_session(request: Request) -> None:
+    """UI pages: redirect to /login without a valid session."""
+    if UI_PASSWORD and not _session_ok(request):
+        raise HTTPException(status_code=303, headers={"Location": "/login"})
 
 
-def _require_api_auth(request: Request) -> None:
-    if UI_PASSWORD and not _valid_session(_session_token(request)):
+def require_session(request: Request) -> None:
+    """UI query APIs: reject with 401 without a valid session cookie."""
+    if UI_PASSWORD and not _session_ok(request):
         raise HTTPException(status_code=401, detail="login required")
 
 
-def _require_api_auth_or_token(request: Request) -> None:
-    """Like ``_require_api_auth`` but also accepts an
-    ``Authorization: Bearer <password>`` header, so programmatic
-    callers can pass the UI password directly instead of logging in
-    for a session cookie first."""
+def require_session_or_password(request: Request) -> None:
+    """Query APIs that also serve programmatic callers: accept a session
+    cookie or an ``Authorization: Bearer <password>`` header carrying
+    the UI password directly instead of logging in for a cookie first."""
     if UI_PASSWORD == "":
         return  # auth disabled
-    if _valid_session(_session_token(request)):
-        return
-    scheme, _, token = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() == "bearer" and secrets.compare_digest(
-        token.encode(), UI_PASSWORD.encode()
-    ):
+    if _session_ok(request) or _bearer_ok(request, UI_PASSWORD):
         return
     raise HTTPException(
         status_code=401,
         detail="login required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def require_alert_token(request: Request) -> None:
+    """Machine ingestion (Alertmanager webhook): open unless
+    ``[alerts] auth_token`` is set, in which case an
+    ``Authorization: Bearer <token>`` header is required (Alertmanager
+    sends it via the receiver's http_config)."""
+    if ALERT_AUTH_TOKEN == "":
+        return  # token auth disabled
+    if _bearer_ok(request, ALERT_AUTH_TOKEN):
+        return
+    raise HTTPException(
+        status_code=401,
+        detail="invalid or missing bearer token",
         headers={"WWW-Authenticate": "Bearer"},
     )
 
@@ -230,7 +372,7 @@ def login_page() -> FileResponse:
     return FileResponse(_STATIC_DIR / "login.html")
 
 
-@app.post("/login")
+@app.post("/login", tags=["Auth"])
 def login(body: LoginRequest, request: Request) -> JSONResponse:
     """Verify the password and issue a session cookie."""
     if UI_PASSWORD == "":
@@ -248,7 +390,7 @@ def login(body: LoginRequest, request: Request) -> JSONResponse:
     return response
 
 
-@app.post("/logout")
+@app.post("/logout", tags=["Auth"])
 def logout() -> JSONResponse:
     response = JSONResponse({"ok": True})
     response.delete_cookie(_SESSION_COOKIE)
@@ -269,7 +411,7 @@ def get_store(request: Request) -> AuditStore:
 StoreDep = Annotated[AuditStore, Depends(get_store)]
 
 
-@app.post("/events", response_model=AuditEventAccepted)
+@app.post("/events", response_model=AuditEventAccepted, tags=["Events"])
 @app.post("/", response_model=AuditEventAccepted, include_in_schema=False)
 def record_events(
     events: Union[AuditEvent, list[AuditEvent]],
@@ -354,7 +496,210 @@ def _should_record(event: AuditEvent) -> bool:
     return True
 
 
-@app.get("/status.ok")
+@app.post(
+    "/alerts",
+    response_model=AlertsAccepted,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_alert_token)],
+    tags=["Alerts"],
+)
+def record_alerts(
+    payload: AlertmanagerPayload,
+    store: StoreDep,
+) -> AlertsAccepted:
+    """Receive an Alertmanager webhook notification.
+
+    Each alert in the notification is appended to the
+    ``alertmanager_alert`` table as delivered (a later ``resolved``
+    notification adds a row; it does not rewrite the ``firing`` one).
+    Timestamps are truncated to whole seconds; Alertmanager's zero
+    ``endsAt`` (``0001-01-01T00:00:00Z``, meaning "still firing") is
+    stored as NULL.
+
+    Stale-user lookup: a firing alert whose alertname is listed in
+    ``[alerts] memory_alert_names`` identifies its host via the
+    ``instance`` label (``IP:port``) and lists the users whose sandboxes
+    on that host were not accessed for more than ``[alerts]
+    stale_days`` days (VIP/whitelisted users excluded) - logged as a
+    warning and attached to the response as ``stale_users`` (omitted
+    when nothing matched). Auto-stop: when ``[alerts] stop_sandboxes``
+    is enabled, the first ``[alerts] stop_limit`` users of each host are
+    additionally stopped via ``[alerts] stop_url`` and the result is
+    counted on the host entry (``stopped`` / ``failed``). The lookup
+    never fails the delivery: Alertmanager must not retry and duplicate
+    the stored alerts.
+
+    Authentication: none when ``[alerts] auth_token`` is empty;
+    otherwise an ``Authorization: Bearer <token>`` header carrying that
+    token is required (configure the same token in the Alertmanager
+    receiver's http_config). The UI password never applies here.
+    """
+    if payload.truncated_alerts:
+        logger.warning(
+            "alertmanager truncated %s alerts in this notification",
+            payload.truncated_alerts,
+        )
+    if not payload.alerts:
+        return AlertsAccepted(accepted=0)
+    # The receiver/group key live on the notification envelope; repeat
+    # them on every alert row so each row is self-contained.
+    envelope = {"receiver": payload.receiver, "group_key": payload.group_key}
+    try:
+        accepted = store.record_alerts(
+            [alert.model_dump() | envelope for alert in payload.alerts]
+        )
+    except Exception:
+        logger.exception("failed to record alerts")
+        raise HTTPException(status_code=502, detail="failed to record alerts")
+    return AlertsAccepted(
+        accepted=accepted, stale_users=_stale_users_for(store, payload.alerts)
+    )
+
+
+def _host_ip(instance: str) -> str:
+    """Strip the ``:port`` from an Alertmanager ``instance`` label
+    (node_exporter style ``10.0.0.1:9100``); a value without a numeric
+    port suffix stays as-is (``pod-1``, bare ``10.0.0.1``)."""
+    head, _, tail = instance.rpartition(":")
+    return head if head and tail.isdigit() else instance
+
+
+def _days_since(last_access: str | None) -> int | None:
+    """Whole days since an ISO timestamp (None when there is none)."""
+    if last_access is None:
+        return None
+    return (datetime.now(timezone.utc) - datetime.fromisoformat(last_access)).days
+
+
+def _stop_request(url: str, body: dict) -> int:
+    """POST one stop call to the claw-catalog stop endpoint; returns the
+    HTTP status code. Kept module-level so tests can monkeypatch it."""
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return response.status
+
+
+def _stop_sandboxes(users: list[dict]) -> tuple[int, int]:
+    """Stop the first ``stop_limit`` stale users' sandbox services.
+
+    Each stop is one POST to ``[alerts] stop_url`` with the user id as
+    ``external_user_id`` and ``[alerts] stop_slug`` as ``slug``. Calls run
+    synchronously, one after another; a failed call (non-2xx status or
+    network error) is logged and counted without stopping the rest. Only
+    runs when ``[alerts] stop_sandboxes`` is enabled; returns
+    ``(stopped, failed)``.
+    """
+    if not STOP_SANDBOXES or not STOP_URL:
+        return (0, 0)
+    stopped = failed = 0
+    for user in users[:STOP_LIMIT]:
+        body = {"external_user_id": user["user_id"], "slug": STOP_SLUG}
+        try:
+            status = _stop_request(STOP_URL, body)
+        except Exception:
+            failed += 1
+            logger.warning(
+                "stop request failed for user %s (sandbox %s)",
+                user["user_id"],
+                user["sandbox_id"],
+            )
+            continue
+        if 200 <= status < 300:
+            stopped += 1
+            logger.info("stopped user %s (sandbox %s)", user["user_id"], user["sandbox_id"])
+        else:
+            failed += 1
+            logger.warning(
+                "stop request for user %s (sandbox %s) returned HTTP %s",
+                user["user_id"],
+                user["sandbox_id"],
+                status,
+            )
+    return (stopped, failed)
+
+
+def _stale_users_for(
+    store: AuditStore, alerts: list[AlertmanagerAlert]
+) -> list[HostStaleUsers] | None:
+    """Stale users per host flagged by the firing memory alerts of a
+    notification.
+
+    Hosts are deduplicated (one query per host; the first alertname that
+    flagged it is reported). A memory alert without an ``instance``
+    label names no host and is skipped with a warning. Lookup failures
+    are logged and skipped - they must not fail the ingestion, or
+    Alertmanager would retry the notification and duplicate the stored
+    alerts.
+    """
+    hosts: dict[str, str] = {}
+    for alert in alerts:
+        if alert.status != "firing":
+            continue
+        if alert.labels.get("alertname") not in MEMORY_ALERT_NAMES:
+            continue
+        instance = alert.labels.get("instance")
+        if not instance:
+            logger.warning(
+                "%s alert %s carries no instance label; host lookup skipped",
+                alert.labels.get("alertname"),
+                alert.fingerprint,
+            )
+            continue
+        hosts.setdefault(_host_ip(instance), alert.labels["alertname"])
+    results: list[HostStaleUsers] = []
+    for host, alertname in hosts.items():
+        try:
+            users = store.list_stale_users(host, STALE_DAYS, WHITELIST_USERS)
+        except Exception:
+            logger.exception("failed to look up stale users on host %s", host)
+            continue
+        if not users:
+            logger.info(
+                "%s alert on host %s: no users stale for >%s days",
+                alertname,
+                host,
+                STALE_DAYS,
+            )
+            continue
+        logger.warning(
+            "%s alert on host %s: %d user(s) not accessed for >%s days"
+            " (VIP excluded): %s",
+            alertname,
+            host,
+            len(users),
+            STALE_DAYS,
+            "; ".join(
+                "%s (sandbox %s, last access %s)"
+                % (
+                    user["user_id"],
+                    user["sandbox_id"],
+                    user["last_access"] or "never recorded",
+                )
+                for user in users
+            ),
+        )
+        stopped, failed = _stop_sandboxes(users)
+        results.append(
+            HostStaleUsers(
+                host=host,
+                alertname=alertname,
+                users=[
+                    StaleUser(days=_days_since(user["last_access"]), **user)
+                    for user in users
+                ],
+                stopped=stopped,
+                failed=failed,
+            )
+        )
+    return results or None
+
+
+@app.get("/status.ok", tags=["System"])
 def healthz() -> dict:
     return {"status": "ok"}
 
@@ -363,9 +708,8 @@ def healthz() -> dict:
 # Query APIs (auth required when server.ui_password is set)
 # ---------------------------------------------------------------------------
 
-@app.get("/api/sandboxes")
+@app.get("/api/sandboxes", dependencies=[Depends(require_session)], tags=["Query"])
 def list_sandboxes(
-    request: Request,
     store: StoreDep,
     search: Annotated[str | None, Query(min_length=1)] = None,
     sort: Annotated[
@@ -397,7 +741,6 @@ def list_sandboxes(
     ``-user_type`` orders by the same membership (ascending = normal
     users first, descending = VIP first).
     """
-    _require_api_auth(request)
     return _safe_query(
         lambda: store.list_latest(
             search=search,
@@ -412,9 +755,12 @@ def list_sandboxes(
     )
 
 
-@app.get("/api/sandboxes/times")
+@app.get(
+    "/api/sandboxes/times",
+    dependencies=[Depends(require_session_or_password)],
+    tags=["Query"],
+)
 def list_sandbox_times(
-    request: Request,
     store: StoreDep,
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
@@ -436,7 +782,6 @@ def list_sandbox_times(
     ``Authorization: Bearer <password>`` header carrying the UI
     password (``server.ui_password``).
     """
-    _require_api_auth_or_token(request)
     return _safe_query(
         lambda: store.list_sandbox_times(
             limit=limit,
@@ -446,9 +791,47 @@ def list_sandbox_times(
     )
 
 
-@app.get("/api/requests")
+@app.get(
+    "/api/host-sandboxes",
+    dependencies=[Depends(require_session_or_password)],
+    tags=["Query"],
+)
+def list_host_sandboxes(
+    store: StoreDep,
+    node_ip: Annotated[str, Query(min_length=1)],
+    stale_days: Annotated[int | None, Query(ge=1)] = None,
+) -> dict:
+    """List the live sandboxes on a host (node IP), one row each:
+    ``user_id``, ``sandbox_id``, ``created_at`` and ``request_time``
+    (the latest request time; ``null`` when the sandbox was never
+    accessed), least-recently-active first.
+
+    ``node_ip`` is the host IP of the node whose sandboxes are listed;
+    an Alertmanager-style ``instance`` label (``IP:port``) is accepted -
+    the ``:port`` is stripped. Deleted sandboxes are excluded (only live
+    sandboxes sit on a host); their audit history stays on
+    ``GET /api/requests``.
+
+    Optional ``stale_days`` keeps only sandboxes whose effective
+    last-active time - the latest request time, or the creation time when
+    the sandbox was never accessed - is older than that many days. A
+    sandbox with no timestamp at all counts as stale. Without it, every
+    live sandbox on the host is returned.
+
+    Authentication: a session cookie (login) or an
+    ``Authorization: Bearer <password>`` header carrying the UI
+    password (``server.ui_password``).
+    """
+    return _safe_query(
+        lambda: store.list_host_sandboxes(
+            node_ip=_host_ip(node_ip),
+            stale_days=stale_days,
+        )
+    )
+
+
+@app.get("/api/requests", dependencies=[Depends(require_session)], tags=["Query"])
 def list_requests(
-    request: Request,
     store: StoreDep,
     sandbox_id: Annotated[str | None, Query(min_length=1)] = None,
     user_id: Annotated[str | None, Query(min_length=1)] = None,
@@ -457,7 +840,6 @@ def list_requests(
 ) -> dict:
     """List access request details, newest first, filterable by sandbox id
     or by user id (all of the user's sandboxes)."""
-    _require_api_auth(request)
     return _safe_query(
         lambda: store.list_details(
             sandbox_id=sandbox_id,
@@ -468,20 +850,44 @@ def list_requests(
     )
 
 
-@app.get("/api/whitelist")
-def get_whitelist(request: Request) -> dict:
+@app.get("/api/alerts", dependencies=[Depends(require_session)], tags=["Alerts"])
+def list_alerts(
+    store: StoreDep,
+    status: Literal["firing", "resolved"] | None = None,
+    search: Annotated[str | None, Query(min_length=1)] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict:
+    """List alerts received from Alertmanager, newest delivery first.
+
+    ``status`` keeps only firing or resolved alerts; ``search``
+    fuzzy-matches fingerprints, receivers, group keys and the JSON text
+    of labels/annotations (alertname, instance, severity, summary etc.
+    all hit with one field).
+    """
+    return _safe_query(
+        lambda: store.list_alerts(
+            status=status,
+            search=search,
+            limit=limit,
+            offset=offset,
+        )
+    )
+
+
+@app.get("/api/whitelist", dependencies=[Depends(require_session)], tags=["Query"])
+def get_whitelist() -> dict:
     """List the whitelisted user ids (``[whitelist] users`` in audit.toml).
 
     The whitelist is informational only - it marks notable users on the
     summary page and does not change what is recorded or who may access
     the UI.
     """
-    _require_api_auth(request)
     return {"users": list(WHITELIST_USERS)}
 
 
-@app.post("/api/sync-deleted")
-def sync_deleted(request: Request, store: StoreDep) -> dict:
+@app.post("/api/sync-deleted", dependencies=[Depends(require_session)], tags=["System"])
+def sync_deleted(store: StoreDep) -> dict:
     """Sync the summary table against the cluster.
 
     Sandboxes whose BatchSandbox resource exists in the namespace
@@ -496,14 +902,13 @@ def sync_deleted(request: Request, store: StoreDep) -> dict:
     name is the sandbox id) are marked ``deleted`` (shown with a ``已删除``
     marker in the UI); previously deleted ids that reappear are restored.
     """
-    _require_api_auth(request)
     if not K8S_NAMESPACE:
         raise HTTPException(
             status_code=400,
             detail="kubernetes.namespace is not configured",
         )
     k8s_client: k8s.K8sClient = getattr(
-        request.app.state, "k8s_client", None
+        app.state, "k8s_client", None
     ) or k8s.K8sClient(KUBECONFIG_PATH)
     try:
         result = _sync_sandboxes(store, k8s_client, K8S_NAMESPACE)
@@ -528,19 +933,25 @@ def _safe_query(query) -> dict:
 # Web pages (auth required when server.ui_password is set)
 # ---------------------------------------------------------------------------
 
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-def index(request: Request):
+@app.get(
+    "/",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+    dependencies=[Depends(require_page_session)],
+)
+def index() -> FileResponse:
     """Serve the per-sandbox summary page."""
-    if UI_PASSWORD and not _valid_session(_session_token(request)):
-        return _login_redirect()
     return FileResponse(_STATIC_DIR / "index.html")
 
 
-@app.get("/details", response_class=HTMLResponse, include_in_schema=False)
-def details(request: Request):
+@app.get(
+    "/details",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+    dependencies=[Depends(require_page_session)],
+)
+def details() -> FileResponse:
     """Serve the request details page."""
-    if UI_PASSWORD and not _valid_session(_session_token(request)):
-        return _login_redirect()
     return FileResponse(_STATIC_DIR / "details.html")
 
 

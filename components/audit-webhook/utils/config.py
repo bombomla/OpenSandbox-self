@@ -46,9 +46,30 @@ _DEFAULTS = {
     "log_level": "INFO",
     "excluded_uri_suffixes": ["ping"],
     "whitelist_users": [],
+    "alert_auth_token": "",
+    # Memory-alert stale-user lookup: firing alerts whose alertname is
+    # listed here trigger a lookup of users on the alert's host (the
+    # instance label, IP:port) not accessed for more than stale_days days
+    # (VIP excluded). Empty list = the lookup is off.
+    "memory_alert_names": [],
+    "stale_days": 7,
+    # Auto-stop on memory alerts: when enabled, a firing memory alert
+    # stops the first stop_limit stale sandboxes' services by POSTing
+    # {"external_user_id": <user_id>, "slug": stop_slug} to stop_url.
+    "stop_sandboxes": False,
+    "stop_url": "http://10.68.205.224:8000/claw-catalog/stop",
+    "stop_slug": "v20260427",
+    "stop_limit": 10,
 }
 
-_INT_KEYS = ("port", "db_pool_min", "db_pool_max", "k8s_sync_interval")
+_INT_KEYS = (
+    "port",
+    "db_pool_min",
+    "db_pool_max",
+    "k8s_sync_interval",
+    "stale_days",
+    "stop_limit",
+)
 
 # TOML section -> flat config keys.
 _SECTION_KEYS = {
@@ -65,6 +86,15 @@ _SECTION_KEYS = {
     },
     "events": {"excluded_uri_suffixes": "excluded_uri_suffixes"},
     "whitelist": {"users": "whitelist_users"},
+    "alerts": {
+        "auth_token": "alert_auth_token",
+        "memory_alert_names": "memory_alert_names",
+        "stale_days": "stale_days",
+        "stop_sandboxes": "stop_sandboxes",
+        "stop_url": "stop_url",
+        "stop_slug": "stop_slug",
+        "stop_limit": "stop_limit",
+    },
     "log": {"level": "log_level"},
 }
 
@@ -147,5 +177,26 @@ def load_config(path: str | Path | None = None) -> dict:
             "of strings"
         )
     config["whitelist_users"] = [user.strip() for user in users if user.strip()]
+
+    names = config["memory_alert_names"]
+    if isinstance(names, str):
+        # Accept a single alertname or an array (firing alerts whose
+        # alertname is listed trigger the stale-user lookup).
+        names = [names]
+    if (
+        not isinstance(names, list)
+        or not all(isinstance(name, str) for name in names)
+    ):
+        raise ValueError(
+            "config key 'alerts.memory_alert_names' must be a string or an "
+            "array of strings"
+        )
+    config["memory_alert_names"] = [name.strip() for name in names if name.strip()]
+
+    if not isinstance(config["stop_sandboxes"], bool):
+        raise ValueError("config key 'alerts.stop_sandboxes' must be a boolean")
+    for key in ("stop_url", "stop_slug"):
+        if not isinstance(config[key], str):
+            raise ValueError(f"config key 'alerts.{key}' must be a string")
 
     return config

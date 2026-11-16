@@ -159,6 +159,82 @@ def test_whitelist_users_invalid_type_raises(tmp_path):
         load_config(path)
 
 
+def test_default_memory_alert_names_and_stale_days(tmp_path):
+    config = load_config(tmp_path / "nonexistent.toml")
+
+    assert config["memory_alert_names"] == []
+    assert config["stale_days"] == 7
+
+
+def test_memory_alert_names_multiple_entries(tmp_path):
+    path = write_config(
+        tmp_path,
+        '[alerts]\nmemory_alert_names = ["HighMemory", "HostMemoryUsage"]\n',
+    )
+
+    config = load_config(path)
+
+    assert config["memory_alert_names"] == ["HighMemory", "HostMemoryUsage"]
+
+
+def test_memory_alert_names_single_string(tmp_path):
+    path = write_config(tmp_path, '[alerts]\nmemory_alert_names = "HighMemory"\n')
+
+    config = load_config(path)
+
+    assert config["memory_alert_names"] == ["HighMemory"]
+
+
+def test_memory_alert_names_invalid_type_raises(tmp_path):
+    path = write_config(tmp_path, "[alerts]\nmemory_alert_names = 42\n")
+
+    with pytest.raises(ValueError, match="memory_alert_names"):
+        load_config(path)
+
+
+def test_stale_days_override(tmp_path):
+    path = write_config(tmp_path, "[alerts]\nstale_days = 14\n")
+
+    config = load_config(path)
+
+    assert config["stale_days"] == 14
+
+
+def test_default_stop_settings(tmp_path):
+    config = load_config(tmp_path / "nonexistent.toml")
+
+    assert config["stop_sandboxes"] is False
+    assert config["stop_url"] == "http://10.68.205.224:8000/claw-catalog/stop"
+    assert config["stop_slug"] == "v20260427"
+
+
+def test_stop_settings_override(tmp_path):
+    path = write_config(
+        tmp_path,
+        '[alerts]\nstop_sandboxes = true\nstop_url = "http://stop:8000/claw-catalog/stop"\nstop_slug = "v19700101"\n',
+    )
+
+    config = load_config(path)
+
+    assert config["stop_sandboxes"] is True
+    assert config["stop_url"] == "http://stop:8000/claw-catalog/stop"
+    assert config["stop_slug"] == "v19700101"
+
+
+def test_stop_sandboxes_must_be_boolean(tmp_path):
+    path = write_config(tmp_path, '[alerts]\nstop_sandboxes = "yes"\n')
+
+    with pytest.raises(ValueError, match="stop_sandboxes"):
+        load_config(path)
+
+
+def test_stop_url_must_be_a_string(tmp_path):
+    path = write_config(tmp_path, "[alerts]\nstop_url = 42\n")
+
+    with pytest.raises(ValueError, match="stop_url"):
+        load_config(path)
+
+
 def test_unknown_keys_and_sections_ignored(tmp_path):
     path = write_config(
         tmp_path,
