@@ -58,6 +58,18 @@ def _app_config(
         egress=egress,
     )
 
+def _app_config_with_soft_affinity() -> AppConfig:
+    """Build an AppConfig with kubernetes.sandbox_memory_soft_affinity enabled."""
+    return AppConfig(
+        runtime=RuntimeConfig(type="kubernetes", execd_image="execd:test"),
+        kubernetes=KubernetesRuntimeConfig(
+            namespace="test-ns",
+            workload_provider="agent-sandbox",
+            sandbox_memory_soft_affinity=True,
+        ),
+        agent_sandbox=AgentSandboxRuntimeConfig(),
+    )
+
 class TestAgentSandboxProvider:
 
     def test_init_sets_crd_constants_correctly(self, mock_k8s_client):
@@ -238,6 +250,93 @@ class TestAgentSandboxProvider:
                 execd_image="execd:latest",
                 platform=PlatformSpec(os="windows", arch="amd64"),
             )
+
+    def test_create_workload_soft_affinity_disabled_by_default(self, mock_k8s_client):
+        provider = AgentSandboxProvider(mock_k8s_client, _app_config())
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "test-uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={"cpu": "1", "memory": "1Gi"},
+            labels={"opensandbox.io/id": "test-id"},
+            expires_at=None,
+            execd_image="execd:latest",
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        pod_spec = body["spec"]["podTemplate"]["spec"]
+        assert "affinity" not in pod_spec
+
+    def test_create_workload_adds_memory_soft_affinity_normal_when_enabled(self, mock_k8s_client):
+        provider = AgentSandboxProvider(
+            mock_k8s_client,
+            _app_config_with_soft_affinity(),
+        )
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "test-uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={"cpu": "1", "memory": "8Gi"},
+            labels={"opensandbox.io/id": "test-id"},
+            expires_at=None,
+            execd_image="execd:latest",
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        pod_spec = body["spec"]["podTemplate"]["spec"]
+        preferred = pod_spec["affinity"]["nodeAffinity"][
+            "preferredDuringSchedulingIgnoredDuringExecution"
+        ]
+        assert preferred == [
+            {
+                "weight": 100,
+                "preference": {
+                    "matchExpressions": [
+                        {"key": "hosttype", "operator": "In", "values": ["normal"]}
+                    ]
+                },
+            }
+        ]
+
+    def test_create_workload_memory_soft_affinity_vip_above_10gi(self, mock_k8s_client):
+        provider = AgentSandboxProvider(
+            mock_k8s_client,
+            _app_config_with_soft_affinity(),
+        )
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "test-uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={"cpu": "1", "memory": "16Gi"},
+            labels={"opensandbox.io/id": "test-id"},
+            expires_at=None,
+            execd_image="execd:latest",
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        pod_spec = body["spec"]["podTemplate"]["spec"]
+        preferred = pod_spec["affinity"]["nodeAffinity"][
+            "preferredDuringSchedulingIgnoredDuringExecution"
+        ]
+        assert preferred[0]["preference"]["matchExpressions"][0]["values"] == ["vip"]
 
     def test_create_workload_rejects_platform_conflict_with_template_selector(self, mock_k8s_client, tmp_path):
         template_file = tmp_path / "agent_template.yaml"

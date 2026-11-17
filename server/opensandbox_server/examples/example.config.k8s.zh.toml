@@ -69,6 +69,11 @@ image_pull_policy = "IfNotPresent"
 # sandbox_cpu_request_fraction = 0.25
 # sandbox_memory_request_fraction = 0.25
 
+# 按沙箱内存 limit 的软亲和调度。为 true 时，Pod 会获得一个 preferred 亲和项，
+# key 为 "hosttype"：内存 limit 小于 10Gi 时值为 "normal"，大于等于 10Gi 时值为 "vip"，
+# 使其倾向调度到对应标签的节点。未带该标签时调度仍可成功。
+sandbox_memory_soft_affinity = false
+
 # public snapshot 等待超时时间。应大于 Kubernetes controller 的
 # snapshot commit-job-timeout。
 snapshot_create_timeout_seconds = 900

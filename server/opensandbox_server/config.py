@@ -645,6 +645,15 @@ class KubernetesRuntimeConfig(BaseModel):
             "(e.g. 0.25 = request is 1/4 of the limit)."
         ),
     )
+    sandbox_memory_soft_affinity: bool = Field(
+        default=False,
+        description=(
+            "Add a node soft-affinity preference keyed by 'hosttype' based on "
+            "the sandbox memory limit: prefer 'hosttype=normal' nodes when the "
+            "limit is below 10Gi and 'hosttype=vip' nodes when it is 10Gi or "
+            "above. Disabled by default."
+        ),
+    )
 
 
 class ExecdInitResources(BaseModel):

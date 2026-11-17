@@ -136,6 +136,7 @@ If `runtime.type = "kubernetes"` and the `[kubernetes]` table is absent, the ser
 | `execd_init_resources` | table \| omitted | `null` | Optional resource requests/limits for the **execd init** container. |
 | `sandbox_cpu_request_fraction` | float | `0.25` | Fraction of the sandbox CPU **limit** used as its CPU **request** (e.g. `0.25` → request = 1/4 of limit). Must be in `(0, 1]`. |
 | `sandbox_memory_request_fraction` | float | `0.25` | Fraction of the sandbox memory **limit** used as its memory **request**. Must be in `(0, 1]`. |
+| `sandbox_memory_soft_affinity` | boolean | `false` | Add a node **soft** affinity preference keyed by `hosttype` based on the sandbox memory limit: prefer **`hosttype=normal`** nodes when the limit is below **10Gi**, **`hosttype=vip`** when it is 10Gi or above. Scheduling still succeeds without the label. |
 
 ### BatchSandbox vs agent-sandbox
 
@@ -156,6 +157,61 @@ Kubernetes workloads are created by a **workload provider**. There is **no** `[b
 |-----|------|-------------|
 | `limits` | map string → string | e.g. `{ cpu = "100m", memory = "128Mi" }` |
 | `requests` | map string → string | e.g. `{ cpu = "50m", memory = "64Mi" }` |
+
+### `kubernetes.sandbox_memory_soft_affinity`
+
+Soft node affinity by sandbox memory limit. When enabled, every sandbox pod (both **BatchSandbox** and **agent-sandbox** providers, template mode) gets a `preferredDuringSchedulingIgnoredDuringExecution` node-affinity term keyed by `hosttype`:
+
+| Memory limit | Preferred label |
+|--------------|-----------------|
+| < 10Gi | `hosttype=normal` |
+| ≥ 10Gi | `hosttype=vip` |
+
+```yaml
+# Generated pod affinity (memory limit = 8Gi):
+affinity:
+  nodeAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+            - key: hosttype
+              operator: In
+              values:
+                - normal
+```
+
+Memory quantities support binary units (`Ki`/`Mi`/`Gi`/…), decimal units (`K`/`M`/`G`/…) and unitless bytes, e.g. `8Gi` → `normal`, `16Gi` → `vip`. If the pod has no memory limit or the value is invalid, no affinity term is injected.
+
+To make this effective, label your nodes accordingly:
+
+```bash
+kubectl label node <plain-node> hosttype=normal
+kubectl label node <vip-node> hosttype=vip
+```
+
+Notes:
+
+- This is a **soft** (preferred) affinity: scheduling still succeeds when no node carries the label — it only influences preference ranking.
+- Existing template affinity settings are preserved; the term is appended.
+- **Pool mode** (`extensions.poolRef`) bypasses pod-spec construction and is not affected.
+
+Configure in `[kubernetes]`:
+
+```toml
+[kubernetes]
+sandbox_memory_soft_affinity = true
+```
+
+Example TOML (see [`example.config.k8s.toml`](opensandbox_server/examples/example.config.k8s.toml)):
+
+```toml
+# Soft node affinity by sandbox memory limit. When true, pods get a preferred
+# node affinity term keyed by "hosttype": value "normal" when the memory limit
+# is below 10Gi, "vip" when it is 10Gi or above. Scheduling still succeeds
+# without the label.
+sandbox_memory_soft_affinity = false
+```
 
 ---
 

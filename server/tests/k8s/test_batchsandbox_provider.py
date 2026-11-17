@@ -721,6 +721,136 @@ spec:
 
         assert "resources" not in container
 
+    def test_create_workload_soft_affinity_disabled_by_default(self, mock_k8s_client):
+        provider = BatchSandboxProvider(mock_k8s_client)
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "sandbox-test", "uid": "uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={"cpu": "1", "memory": "1Gi"},
+            labels={},
+            expires_at=None,
+            execd_image="execd:latest"
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        pod_spec = body["spec"]["template"]["spec"]
+        assert "affinity" not in pod_spec
+
+    def test_create_workload_adds_memory_soft_affinity_normal_when_enabled(self, mock_k8s_client):
+        provider = BatchSandboxProvider(
+            mock_k8s_client,
+            AppConfig(
+                runtime=RuntimeConfig(type="kubernetes", execd_image="execd:test"),
+                kubernetes=KubernetesRuntimeConfig(
+                    namespace="test-ns",
+                    sandbox_memory_soft_affinity=True,
+                ),
+            ),
+        )
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "sandbox-test", "uid": "uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={"cpu": "1", "memory": "8Gi"},
+            labels={},
+            expires_at=None,
+            execd_image="execd:latest"
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        pod_spec = body["spec"]["template"]["spec"]
+        preferred = pod_spec["affinity"]["nodeAffinity"][
+            "preferredDuringSchedulingIgnoredDuringExecution"
+        ]
+        assert preferred == [
+            {
+                "weight": 100,
+                "preference": {
+                    "matchExpressions": [
+                        {"key": "hosttype", "operator": "In", "values": ["normal"]}
+                    ]
+                },
+            }
+        ]
+
+    def test_create_workload_memory_soft_affinity_vip_above_10gi(self, mock_k8s_client):
+        provider = BatchSandboxProvider(
+            mock_k8s_client,
+            AppConfig(
+                runtime=RuntimeConfig(type="kubernetes", execd_image="execd:test"),
+                kubernetes=KubernetesRuntimeConfig(
+                    namespace="test-ns",
+                    sandbox_memory_soft_affinity=True,
+                ),
+            ),
+        )
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "sandbox-test", "uid": "uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={"cpu": "1", "memory": "16Gi"},
+            labels={},
+            expires_at=None,
+            execd_image="execd:latest"
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        pod_spec = body["spec"]["template"]["spec"]
+        preferred = pod_spec["affinity"]["nodeAffinity"][
+            "preferredDuringSchedulingIgnoredDuringExecution"
+        ]
+        assert preferred[0]["preference"]["matchExpressions"][0]["values"] == ["vip"]
+
+    def test_create_workload_soft_affinity_no_memory_limit_noop(self, mock_k8s_client):
+        provider = BatchSandboxProvider(
+            mock_k8s_client,
+            AppConfig(
+                runtime=RuntimeConfig(type="kubernetes", execd_image="execd:test"),
+                kubernetes=KubernetesRuntimeConfig(
+                    namespace="test-ns",
+                    sandbox_memory_soft_affinity=True,
+                ),
+            ),
+        )
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "sandbox-test", "uid": "uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={"cpu": "1"},
+            labels={},
+            expires_at=None,
+            execd_image="execd:latest"
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        pod_spec = body["spec"]["template"]["spec"]
+        assert "affinity" not in pod_spec
+
     def test_create_workload_translates_gpu_to_nvidia_extended_resource(self, mock_k8s_client):
         provider = BatchSandboxProvider(mock_k8s_client)
         mock_k8s_client.create_custom_object.return_value = {

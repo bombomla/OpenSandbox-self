@@ -69,6 +69,12 @@ image_pull_policy = "IfNotPresent"
 # sandbox_cpu_request_fraction = 0.25
 # sandbox_memory_request_fraction = 0.25
 
+# Soft node affinity by sandbox memory limit. When true, pods get a preferred
+# node affinity term keyed by "hosttype": value "normal" when the memory limit
+# is below 10Gi, "vip" when it is 10Gi or above. Scheduling still succeeds
+# without the label.
+sandbox_memory_soft_affinity = false
+
 # Public snapshot wait timeout. Keep this greater than the Kubernetes
 # controller snapshot commit-job-timeout.
 snapshot_create_timeout_seconds = 900

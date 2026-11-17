@@ -38,6 +38,7 @@ from opensandbox_server.services.k8s.provider_common import (
     _workload_platform_constraint_scope,
 )
 from opensandbox_server.services.k8s.volume_helper import apply_volumes_to_pod_spec
+from opensandbox_server.services.k8s.resource_utils import apply_memory_soft_affinity
 from opensandbox_server.services.k8s.workload_provider import WorkloadProvider
 from opensandbox_server.services.k8s.windows_profile import is_windows_profile
 from opensandbox_server.services.runtime_resolver import SecureRuntimeResolver
@@ -99,6 +100,9 @@ class AgentSandboxProvider(WorkloadProvider):
         )
         self.memory_request_fraction = (
             k8s_config.sandbox_memory_request_fraction if k8s_config else 0.25
+        )
+        self.memory_soft_affinity = (
+            k8s_config.sandbox_memory_soft_affinity if k8s_config else False
         )
 
         self.resolver = SecureRuntimeResolver(app_config) if app_config else None
@@ -292,6 +296,12 @@ class AgentSandboxProvider(WorkloadProvider):
             egress_image=egress_image,
             egress_auth_token=egress_auth_token,
             egress_mode=egress_mode,
+        )
+
+        apply_memory_soft_affinity(
+            pod_spec=pod_spec,
+            resource_limits=resource_limits,
+            enabled=self.memory_soft_affinity,
         )
 
         return pod_spec
